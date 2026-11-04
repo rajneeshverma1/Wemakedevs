@@ -1,0 +1,940 @@
+name: Switch Console release
+
+# Builds the Switch Console desktop app and publishes it to a GitHub Release on this
+# repo, so anyone can install it without building from source. The repo is public,
+# so the release assets are too — no token, no ACL.
+#
+# macOS (arm64 and x64) is signed + notarized. Linux (x64 and arm64) builds
+# AppImage, deb and rpm, unsigned. Every macOS and Linux arch builds on a runner of
+# that arch. Windows (x64) builds nsis and msi, signed with Azure Artifact Signing
+# on main and tags, where the `release` environment supplies the OIDC credentials;
+# a dispatch from any other branch builds the same artifacts unsigned, and those
+# warn via SmartScreen on first run (CHOO-1468).
+#
+# The two macOS jobs do NOT upload a channel manifest. electron-builder gives Linux
+# a per-arch channel file but macOS none, so both write `latest-mac.yml` and one
+# would overwrite the other, leaving that architecture with no update feed and no
+# error to show for it. `merge-mac-manifest` combines them into the single manifest
+# electron-updater expects, listing both architectures (CHOO-2195).
+#
+# Trigger by pushing a tag like `switch-console-v1.1.34` (the version after
+# `switch-console-v` MUST match apps/switch-console-desktop/package.json `version`).
+# `workflow_dispatch` builds the artifacts for testing without creating a Release.
+#
+# Canary: push a tag like `v0.38.0-canary.3` (or `v0.38.0-canary.rc.1` for a release
+# candidate) on a commit that is on `main` or a `release/*` branch. The same jobs
+# build with the canary identity and config, stamp the tag's version into
+# package.json on the runner (nothing is committed), upload `canary*.yml` channel
+# files instead of `latest*.yml`, and publish a **prerelease** that is never marked
+# Latest — stable installs read only the Latest release, so they never see it. The
+# tag has no `switch-console-` prefix because electron-updater's canary lookup
+# skips any tag that is not a bare semver. Only the newest canaries are kept.
+#
+# The Release stays a **draft** until every platform job has uploaded, and is
+# published by the final `publish-release` job. A draft is invisible to
+# electron-updater (`/releases/latest` skips drafts, and the prerelease listing
+# filters them), so a half-uploaded Release can never become the update feed.
+#
+# Builds are signed + notarized with the org's Developer ID when the Apple secrets
+# (APPLE_CSC_LINK / APPLE_CSC_KEY_PASSWORD / APPLE_API_KEY_P8 / APPLE_API_KEY_ID /
+# APPLE_API_ISSUER) are present; without them they fall back to an unsigned ad-hoc
+# build.
+
+on:
+  push:
+    tags:
+      - 'switch-console-v*'
+      - 'v*-canary.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: console
+
+jobs:
+  # Decides, once, what this run builds: the channel, the version, and the names
+  # that differ between channels. Every other job reads these outputs rather than
+  # re-deriving them from the ref, and every tag rule is enforced here.
+  resolve:
+    name: Resolve channel and version
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.resolve.outputs.channel }}
+      version: ${{ steps.resolve.outputs.version }}
+      builder_config: ${{ steps.resolve.outputs.builder_config }}
+      manifest: ${{ steps.resolve.outputs.manifest }}
+      artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
+      vite_build: ${{ steps.resolve.outputs.vite_build }}
+      vite_release: ${{ steps.resolve.outputs.vite_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Branch and tag history, to check which branches contain a canary tag.
+          fetch-depth: 0
+
+      - name: Resolve
+        id: resolve
+        run: |
+          pkg_version="$(node -p "require('./apps/switch-console-desktop/package.json').version")"
+          case "$GITHUB_REF" in
+            refs/tags/switch-console-v*)
+              channel=stable
+              version="${GITHUB_REF_NAME#switch-console-v}"
+              echo "tag=$version package.json=$pkg_version"
+              if [ "$version" != "$pkg_version" ]; then
+                echo "::error::Tag version ($version) does not match apps/switch-console-desktop/package.json version ($pkg_version). Bump package.json and re-tag."
+                exit 1
+              fi
+              ;;
+            refs/tags/v*)
+              channel=canary
+              version="${GITHUB_REF_NAME#v}"
+              if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-canary\.([0-9]+|rc\.[0-9]+)$'; then
+                echo "::error::Canary tag $GITHUB_REF_NAME must look like v1.2.0-canary.<n> or v1.2.0-canary.rc.<n>."
+                exit 1
+              fi
+              # A canary previews an unreleased version. One at or below the
+              # current stable would rank below what stable users already run,
+              # and canary installs would never move to it.
+              base="${version%%-*}"
+              echo "canary base=$base package.json=$pkg_version"
+              if [ "$(printf '%s\n%s\n' "$pkg_version" "$base" | sort -V | head -n1)" != "$pkg_version" ]; then
+                echo "::error::Canary base version $base is below package.json $pkg_version."
+                exit 1
+              fi
+              if git rev-parse -q --verify "refs/tags/switch-console-v$base" >/dev/null; then
+                echo "::error::switch-console-v$base is already released; a canary must preview a later version."
+                exit 1
+              fi
+              commit="$(git rev-parse "$GITHUB_REF^{commit}")"
+              branches="$(git branch -r --contains "$commit" --format='%(refname:short)')"
+              echo "branches containing $commit:"
+              echo "$branches"
+              if ! printf '%s\n' "$branches" | grep -Eq '^origin/(main|release/.+)$'; then
+                echo "::error::Canary tag $GITHUB_REF_NAME points at $commit, which is not on main or a release/* branch."
+                exit 1
+              fi
+              ;;
+            *)
+              # workflow_dispatch: a stable test build of the current package.json.
+              channel=stable
+              version="$pkg_version"
+              ;;
+          esac
+          # A tagged build is a published release; a workflow_dispatch test build
+          # is not. The app reports its usage to production's Amplitude project
+          # (or staging's, for a canary) only when this says it is a release.
+          case "$GITHUB_REF" in
+            refs/tags/*) vite_release=1 ;;
+            *) vite_release= ;;
+          esac
+          if [ "$channel" = canary ]; then
+            builder_config=electron-builder.canary.config.ts
+            manifest=canary
+            artifact_prefix=switch-console-canary
+            vite_build=canary
+          else
+            builder_config=electron-builder.config.ts
+            manifest=latest
+            artifact_prefix=switch-console
+            vite_build=
+          fi
+          {
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "builder_config=$builder_config"
+            echo "manifest=$manifest"
+            echo "artifact_prefix=$artifact_prefix"
+            echo "vite_build=$vite_build"
+            echo "vite_release=$vite_release"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # Creates the (assetless) Release up front so the platform jobs can run
+  # concurrently and each upload into it, rather than chaining Linux behind macOS
+  # purely to wait for the Release to exist. It is created as a draft: an
+  # assetless or half-uploaded published Release breaks every installed app on
+  # the platform whose manifest is still missing (ERR_UPDATER_CHANNEL_FILE_NOT_FOUND),
+  # and the macOS job can sit for hours waiting on `release`-environment approval.
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: resolve
+    if: startsWith(github.ref, 'refs/tags/')
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Create the Release (canary prerelease)
+        if: needs.resolve.outputs.channel == 'canary'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          notes="Switch Console Canary $VERSION — a preview build for internal testing. Canary installs update themselves to newer canaries; stable installs never see this release.
+
+          Download the \`switch-console-canary-*\` installer for your platform."
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Switch Console Canary $VERSION" \
+            --draft \
+            --prerelease \
+            --notes "$notes"
+
+      - name: Create the Release
+        if: needs.resolve.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ needs.resolve.outputs.version }}
+        run: |
+          notes="Switch Console desktop app $version — macOS Apple silicon + Intel, Linux x64 + arm64, and Windows x64.
+
+          **macOS:** download the .dmg for your Mac — \`switch-console-arm64.dmg\` for Apple silicon (M1 and later), \`switch-console-x64.dmg\` for Intel. Not sure which you have? Apple menu → About This Mac. Open it and drag Switch Console to Applications. Both are signed and notarized with SandboxAQ's Developer ID — they open without a Gatekeeper bypass, and both receive in-app updates.
+
+          **Linux (x64 and arm64):** match your \`dpkg --print-architecture\`. Download the .AppImage (\`chmod +x\` then run), the .deb (\`sudo apt install ./<file>.deb\`) or the .rpm (\`sudo dnf install ./<file>.rpm\`). Linux builds are unsigned.
+
+          **Windows (x64):** run \`switch-console-x64.exe\`, or use \`switch-console-x64.msi\` for an \`msiexec\` install. Both are Authenticode signed as SandboxAQ, so no SmartScreen bypass is needed, and in-app updates verify that signature before installing."
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Switch Console $version" \
+            --draft \
+            --notes "$notes"
+
+  build-macos:
+    name: Build & release (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # The Apple Developer ID signing secrets live in the `release` environment
+    # (required reviewers + branch policy), so a run must be approved and can
+    # only come from main or a tag — a workflow_dispatch from an arbitrary
+    # branch cannot reach the org signing identity.
+    environment: release
+    # Runs on dispatch too (from main), where create-release is skipped rather
+    # than run. Restricted to main / tags so a feature-branch dispatch is skipped.
+    needs: [resolve, create-release]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.create-release.result != 'failure' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main') }}
+    strategy:
+      # One arch must not take the other down with it. A half-built pair still
+      # cannot ship: merge-mac-manifest needs both manifests, and publish-release
+      # needs what it produces.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            # A native Intel runner rather than a flag on the Apple silicon job.
+            # `npmRebuild` is off, so the native modules baked into the package are
+            # the ones `pnpm rebuild` produced on this machine; cross-building
+            # would emit an x64 package carrying arm64 `.node` files, which
+            # installs, launches, and dies on the first database or terminal call.
+            # `macos-13` was retired in December 2025 — `macos-15-intel` is the
+            # x86_64 image, and GitHub retires x86_64 macOS entirely in 2027.
+            runner: macos-15-intel
+    # Surface the cert/key secrets through env so step-level `if:` can gate on
+    # them — the `secrets` context is not allowed in `if:` expressions.
+    env:
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      HAS_DEVELOPER_ID: ${{ secrets.APPLE_CSC_LINK != '' && 'true' || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.5.3
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+
+      - name: Stamp the canary version
+        # The app reports, and electron-updater compares, package.json's version.
+        # A canary's comes from its tag and is written here, never committed.
+        if: needs.resolve.outputs.channel == 'canary'
+        working-directory: console/apps/switch-console-desktop
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          node -p "require('./package.json').version"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Rebuild native modules for Electron
+        # postinstall skips electron-rebuild under CI; do it explicitly so
+        # better-sqlite3 / node-pty match the packaged Electron ABI.
+        run: pnpm --filter @switch-console/desktop run rebuild
+
+      - name: Build workspace packages + app
+        # Root recursive build (topological): packages/** then the desktop app.
+        env:
+          VITE_BUILD: ${{ needs.resolve.outputs.vite_build }}
+          VITE_RELEASE: ${{ needs.resolve.outputs.vite_release }}
+          # Only canary knows where Switch Cloud is; a build without it offers no Cloud.
+          MAIN_VITE_SWITCH_CLOUD_URL: ${{ needs.resolve.outputs.channel == 'canary' && vars.SWITCH_CLOUD_URL || '' }}
+        run: pnpm run build
+
+      - name: Write App Store Connect API key
+        # electron-builder's notarizer wants the .p8 as a file path. Only write it
+        # when the secret is present; absence leaves APPLE_API_KEY empty so the
+        # package step falls back to an unsigned/ad-hoc build.
+        if: ${{ env.APPLE_API_KEY_P8 != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/appstore"
+          printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/appstore/AuthKey.p8"
+          echo "APPLE_API_KEY=$RUNNER_TEMP/appstore/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Package (mac ${{ matrix.arch }}, no publish)
+        working-directory: console/apps/switch-console-desktop
+        env:
+          # Developer ID signing: when the cert secret is set, electron-builder
+          # signs with it and the config enables notarization. When it's empty,
+          # disable identity discovery so the build falls back to ad-hoc signing
+          # instead of failing on a missing identity.
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.APPLE_CSC_LINK != '' && 'true' || 'false' }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: pnpm exec electron-builder --mac --${{ matrix.arch }} --publish never --config ${{ needs.resolve.outputs.builder_config }}
+
+      - name: Verify the package is really ${{ matrix.arch }}
+        # The flag says which arch was asked for; these binaries say which was
+        # produced. A package built for the wrong arch installs and launches and
+        # then dies on the first wrong-arch `.node`, so check rather than trust.
+        working-directory: console/apps/switch-console-desktop
+        run: |
+          case "${{ matrix.arch }}" in
+            arm64) expected=arm64; foreign=darwin-x64 ;;
+            x64) expected=x86_64; foreign=darwin-arm64 ;;
+            *) echo "::error::unhandled arch '${{ matrix.arch }}'"; exit 1 ;;
+          esac
+          apps=()
+          while IFS= read -r found; do
+            apps+=("$found")
+          done < <(find release -maxdepth 2 -type d -name '*.app')
+          if [ "${#apps[@]}" -ne 1 ]; then
+            # One target arch means one bundle. More than one means the config
+            # started building both again, and checking an arbitrary bundle would
+            # make this assertion a coin flip on the wrong one.
+            echo "::error::expected exactly one .app under release/, found ${#apps[@]}"
+            printf '%s\n' "${apps[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          binaries=("$app/Contents/MacOS/$(basename "$app" .app)")
+          modules=0
+          skipped=0
+          while IFS= read -r module; do
+            # Dependencies vendor a prebuilt binary per target — node-pty ships
+            # Windows ones, which are not Mach-O at all, next to both macOS
+            # arches. A path naming a target other than ours says nothing about
+            # what this build produced. The binaries that do — the electron-rebuild
+            # output under `build/Release` — name no target, so they are always
+            # checked.
+            case "$module" in
+              *win32*|*linux*|*"$foreign"*)
+                skipped=$((skipped + 1))
+                continue
+                ;;
+            esac
+            binaries+=("$module")
+            modules=$((modules + 1))
+          done < <(find "$app" -type f -name '*.node')
+          if [ "$modules" -eq 0 ]; then
+            # asarUnpack is what leaves the native modules on disk to inspect. If
+            # they stop appearing, this check has quietly stopped checking.
+            echo "::error::found no unpacked .node to check under $app — cannot verify native module arch"
+            exit 1
+          fi
+          echo "checking ${#binaries[@]} binaries ($skipped vendored non-$expected prebuild(s) skipped)"
+          failed=""
+          for binary in "${binaries[@]}"; do
+            archs="$(lipo -archs "$binary" 2>/dev/null || echo "unreadable")"
+            case " $archs " in
+              *" $expected "*) echo "ok    $archs  $binary" ;;
+              *) echo "::error::$binary is '$archs', expected $expected"; failed=1 ;;
+            esac
+          done
+          [ -z "$failed" ]
+
+      - name: Verify Gatekeeper accepts the app
+        # Only meaningful with a real Developer ID: without one the build is
+        # ad-hoc signed, which Gatekeeper rejects by design. An Intel .dmg that
+        # trips Gatekeeper is worse than no Intel .dmg — it looks shipped and
+        # fails in the user's hands — so the release build asserts it here.
+        if: ${{ env.HAS_DEVELOPER_ID == 'true' }}
+        working-directory: console/apps/switch-console-desktop
+        run: |
+          apps=()
+          while IFS= read -r found; do
+            apps+=("$found")
+          done < <(find release -maxdepth 2 -type d -name '*.app')
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .app under release/, found ${#apps[@]}"
+            printf '%s\n' "${apps[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          # These two verifications reach Apple's servers, so a transient runner
+          # network drop (seen as NSURLError -1005 from `stapler validate`) fails
+          # the whole release even though the bundle is correctly signed, notarized
+          # and stapled. Retry the network step with backoff before giving up; a
+          # real validation failure still fails after the retries are spent.
+          retry() {
+            local n=1 max=5 delay=15
+            until "$@"; do
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::'$*' still failing after $max attempts"
+                return 1
+              fi
+              echo "attempt $n/$max failed; retrying in ${delay}s" >&2
+              sleep "$delay"
+              n=$((n + 1))
+              delay=$((delay * 2))
+            done
+          }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # The stapled ticket is what lets a Mac clear the app offline; without it
+          # the first launch is a Gatekeeper prompt however well-signed the bundle is.
+          retry xcrun stapler validate "$app"
+          # `spctl --assess` reports a rejected build as accepted when assessment is
+          # switched off on the machine, so the assessment is worth nothing until
+          # this says it is on.
+          status="$(spctl --status 2>&1)"
+          echo "$status"
+          case "$status" in
+            *"assessments enabled"*) ;;
+            *) echo "::error::Gatekeeper assessment is off on this runner ($status) — spctl --assess cannot be trusted here"; exit 1 ;;
+          esac
+          retry spctl --assess --type execute --verbose=4 "$app"
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: console/apps/switch-console-desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Installers and blockmaps only. `latest-mac.yml` is deliberately absent:
+          # unlike Linux, macOS has no per-arch channel file, so both arches write
+          # that one name and the second upload would replace the first — leaving
+          # the overwritten architecture with an update feed that never offers it
+          # anything. merge-mac-manifest publishes the combined manifest instead.
+          shopt -s nullglob
+          assets=(release/*.dmg release/*.zip release/*.blockmap)
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Upload the channel manifest for merging
+        # Every run, tag or dispatch: this is the merge job's only input, and a
+        # dispatch run is where a broken manifest should surface.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mac-update-manifest-${{ matrix.arch }}
+          path: console/apps/switch-console-desktop/release/${{ needs.resolve.outputs.manifest }}-mac.yml
+          if-no-files-found: error
+
+      - name: Upload build artifacts (dispatch runs, no Release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: switch-console-macos-${{ matrix.arch }}
+          path: |
+            console/apps/switch-console-desktop/release/*.dmg
+            console/apps/switch-console-desktop/release/*.zip
+          if-no-files-found: error
+
+  # electron-updater reads exactly one macOS channel file, `latest-mac.yml`, and
+  # chooses a download from its `files` list by whether the file name contains
+  # `arm64`. One manifest listing both architectures is therefore the shape it
+  # wants — and the shape electron-builder itself emits when a single invocation
+  # builds both. Two native builds cannot produce it between them, so the two
+  # per-arch manifests are combined here.
+  merge-mac-manifest:
+    name: Merge the macOS channel manifest
+    runs-on: ubuntu-latest
+    needs: [resolve, build-macos]
+    # Skipped when either mac job failed or was skipped, which leaves no
+    # macOS channel file on the Release and stops publish-release.
+    if: ${{ !cancelled() && needs.build-macos.result == 'success' }}
+    env:
+      # `latest` or `canary`: electron-updater's channel file name for this build.
+      MANIFEST: ${{ needs.resolve.outputs.manifest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.5.3
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download the per-arch manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: mac-update-manifest-*
+          path: mac-manifests
+
+      - name: Merge into one ${{ needs.resolve.outputs.manifest }}-mac.yml
+        working-directory: console/apps/switch-console-desktop
+        run: |
+          node --experimental-strip-types scripts/merge-mac-update-manifest.ts \
+            --out "$RUNNER_TEMP/$MANIFEST-mac.yml" \
+            arm64="$GITHUB_WORKSPACE/mac-manifests/mac-update-manifest-arm64/$MANIFEST-mac.yml" \
+            x64="$GITHUB_WORKSPACE/mac-manifests/mac-update-manifest-x64/$MANIFEST-mac.yml"
+          cat "$RUNNER_TEMP/$MANIFEST-mac.yml"
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/$MANIFEST-mac.yml" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Upload the merged manifest (dispatch runs, no Release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: switch-console-macos-manifest
+          path: ${{ runner.temp }}/${{ needs.resolve.outputs.manifest }}-mac.yml
+          if-no-files-found: error
+
+  build-linux:
+    name: Build & release (Linux ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Waits only for the Release to exist, not for the macOS build — the two
+    # platform jobs are independent. Linux is unsigned, so no cert secrets.
+    needs: [resolve, create-release]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.create-release.result != 'failure' }}
+    env:
+      MANIFEST: ${{ needs.resolve.outputs.manifest }}
+    strategy:
+      # One arch must not take the other down with it: an arm64 runner outage
+      # should still ship x64.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            # Native arm64 runner rather than cross-building: `npmRebuild` is
+            # off, so the native modules baked into the package are the ones
+            # `pnpm rebuild` produced on this machine. Cross-building would
+            # emit an arm64 package carrying x64 `.node` files.
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.5.3
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+
+      - name: Install rpm tooling
+        # electron-builder's rpm target needs the `rpm` binary; deb + AppImage
+        # tooling is already present on ubuntu-latest.
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Stamp the canary version
+        # The app reports, and electron-updater compares, package.json's version.
+        # A canary's comes from its tag and is written here, never committed.
+        if: needs.resolve.outputs.channel == 'canary'
+        working-directory: console/apps/switch-console-desktop
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          node -p "require('./package.json').version"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Rebuild native modules for Electron
+        run: pnpm --filter @switch-console/desktop run rebuild
+
+      - name: Build workspace packages + app
+        env:
+          VITE_BUILD: ${{ needs.resolve.outputs.vite_build }}
+          VITE_RELEASE: ${{ needs.resolve.outputs.vite_release }}
+          # Only canary knows where Switch Cloud is; a build without it offers no Cloud.
+          MAIN_VITE_SWITCH_CLOUD_URL: ${{ needs.resolve.outputs.channel == 'canary' && vars.SWITCH_CLOUD_URL || '' }}
+        run: pnpm run build
+
+      - name: Package (linux ${{ matrix.arch }}, no publish)
+        working-directory: console/apps/switch-console-desktop
+        run: pnpm exec electron-builder --linux --${{ matrix.arch }} --publish never --config ${{ needs.resolve.outputs.builder_config }}
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: console/apps/switch-console-desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Attach the Linux installers + the electron-updater channel manifest
+          # so auto-update works on Linux too. The glob covers both manifests:
+          # electron-builder names the arm64 one `latest-linux-arm64.yml`, and
+          # each arch's job uploads only its own.
+          shopt -s nullglob
+          assets=(release/*.AppImage release/*.deb release/*.rpm release/*.blockmap "release/$MANIFEST"-linux*.yml)
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Upload build artifacts (dispatch runs, no Release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: switch-console-linux-${{ matrix.arch }}
+          path: |
+            console/apps/switch-console-desktop/release/*.AppImage
+            console/apps/switch-console-desktop/release/*.deb
+            console/apps/switch-console-desktop/release/*.rpm
+          if-no-files-found: error
+
+  build-windows:
+    name: Build & release (Windows x64)
+    runs-on: windows-latest
+    # Waits only for the Release to exist, not for the other platform builds.
+    needs: [resolve, create-release]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.create-release.result != 'failure' }}
+    # The Azure signing credentials live in the `release` environment, whose
+    # federated credential is scoped to `environment:release` — so entering it is
+    # what makes the OIDC token acceptable to Azure at all. Only main and tags may
+    # enter it. Everywhere else this resolves to no environment, the login step is
+    # skipped, and the build produces an unsigned installer rather than failing:
+    # that is what keeps a branch dispatch a usable test of everything except the
+    # signature itself.
+    environment: ${{ (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main') && 'release' || '' }}
+    permissions:
+      contents: write
+      # Required for the workflow to mint the OIDC token azure/login exchanges.
+      id-token: write
+    # Surfaced through env because the `secrets` context is not allowed in `if:`,
+    # and because electron-builder's Azure signing path reads these directly.
+    # Outside the `release` environment they are empty, which is what makes the
+    # config leave `azureSignOptions` off and produce an unsigned build.
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      MANIFEST: ${{ needs.resolve.outputs.manifest }}
+      INSTALLER: release/${{ needs.resolve.outputs.artifact_prefix }}-x64.exe
+    # windows-latest defaults to pwsh; the scripted steps below are bash.
+    defaults:
+      run:
+        shell: bash
+        working-directory: console
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.5.3
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: console/.nvmrc
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+
+      - name: Stamp the canary version
+        # The app reports, and electron-updater compares, package.json's version.
+        # A canary's comes from its tag and is written here, never committed.
+        if: needs.resolve.outputs.channel == 'canary'
+        working-directory: console/apps/switch-console-desktop
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          node -p "require('./package.json').version"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Rebuild native modules for Electron
+        # better-sqlite3 and node-pty compile from source here, against the MSVC
+        # toolchain preinstalled on the runner.
+        run: pnpm --filter @switch-console/desktop run rebuild
+
+      - name: Build workspace packages + app
+        env:
+          VITE_BUILD: ${{ needs.resolve.outputs.vite_build }}
+          VITE_RELEASE: ${{ needs.resolve.outputs.vite_release }}
+          # Only canary knows where Switch Cloud is; a build without it offers no Cloud.
+          MAIN_VITE_SWITCH_CLOUD_URL: ${{ needs.resolve.outputs.channel == 'canary' && vars.SWITCH_CLOUD_URL || '' }}
+        run: pnpm run build
+
+      - name: Azure login for Artifact Signing
+        # Federated OIDC, so there is no stored client secret to leak. Absent on
+        # runs outside the `release` environment, where AZURE_CLIENT_ID is empty
+        # and the package step below then builds unsigned.
+        if: ${{ env.AZURE_CLIENT_ID != '' }}
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Package (windows x64, no publish)
+        working-directory: console/apps/switch-console-desktop
+        run: pnpm exec electron-builder --win --publish never --config ${{ needs.resolve.outputs.builder_config }}
+
+      - name: Verify the installer's signature and update manifest
+        # The build logs "signing with signtool.exe" whether or not a certificate
+        # was found, so the log cannot answer this. Read the PE certificate table
+        # instead, and fail a signed run that silently produced nothing.
+        working-directory: console/apps/switch-console-desktop
+        run: |
+          signed="$(node -e '
+            const fs = require("fs");
+            const d = fs.readFileSync(process.env.INSTALLER);
+            const pe = d.readUInt32LE(0x3c);
+            const magic = d.readUInt16LE(pe + 24);
+            const dirs = pe + 24 + (magic === 0x20b ? 112 : 96);
+            process.stdout.write(String(d.readUInt32LE(dirs + 4 * 8 + 4)));
+          ')"
+          # The manifest electron-updater reads at runtime; the publisher name it
+          # will demand of every later update is written here, or not at all.
+          manifest=release/win-unpacked/resources/app-update.yml
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — the build produced no update manifest to check."
+            exit 1
+          fi
+          if [ "$signed" != "0" ]; then
+            echo "Authenticode signature present ($signed bytes)."
+            status="$(powershell -NoProfile -Command \
+              "(Get-AuthenticodeSignature '$INSTALLER').Status" | tr -d '\r')"
+            subject="$(powershell -NoProfile -Command \
+              "(Get-AuthenticodeSignature '$INSTALLER').SignerCertificate.Subject" | tr -d '\r')"
+            echo "status: $status"
+            echo "subject: $subject"
+            if [ "$status" != "Valid" ]; then
+              echo "::error::Authenticode status is $status, not Valid."
+              exit 1
+            fi
+            # A certificate that stops matching the manifest has to fail the
+            # release here: installs already in the field would otherwise go on
+            # refusing updates, silently and indefinitely.
+            if ! grep -q '^publisherName' "$manifest"; then
+              echo "::error::Installer is signed but $manifest declares no publisherName — updates would install unverified."
+              exit 1
+            fi
+            if ! grep -qF "$subject" "$manifest"; then
+              echo "::error::$manifest does not name the signing certificate's subject ($subject). Update win.azureSignOptions.publisherName to match."
+              cat "$manifest"
+              exit 1
+            fi
+            echo "app-update.yml names the signing certificate — updates will verify."
+          elif [ -n "$AZURE_CLIENT_ID" ]; then
+            echo "::error::Azure credentials were present but the installer is unsigned."
+            exit 1
+          else
+            echo "::notice::No Azure credentials on this run — installer is unsigned, as expected."
+            # An unsigned build must not claim a publisher either: electron-updater
+            # would then reject its own unsigned successors.
+            if grep -q '^publisherName' "$manifest"; then
+              echo "::error::Unsigned build declared a publisherName — updates from it would never verify."
+              exit 1
+            fi
+          fi
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: console/apps/switch-console-desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Attach the Windows installers + the electron-updater channel manifest
+          # (latest.yml) and the blockmaps that differentialPackage emits.
+          shopt -s nullglob
+          assets=(release/*.exe release/*.msi release/*.blockmap "release/$MANIFEST.yml")
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Upload build artifacts (dispatch runs, no Release)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: switch-console-windows-x64
+          # latest.yml rides along so a dispatch run shows whether the channel
+          # manifest was produced — publish-release refuses to publish a tagged
+          # Release without it, and a dispatch run is where that should surface.
+          path: |
+            console/apps/switch-console-desktop/release/*.exe
+            console/apps/switch-console-desktop/release/*.msi
+            console/apps/switch-console-desktop/release/latest.yml
+          if-no-files-found: error
+
+  # Flips the draft to a published Release, once — and only once — every platform
+  # job has uploaded. `needs` with no `if: !cancelled()` is the gate: if either
+  # build fails, is cancelled or is never approved, this job is skipped and the
+  # Release stays a draft, visible to maintainers and to nobody's updater.
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [resolve, create-release, build-macos, merge-mac-manifest, build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    # This job never checks out, so the workflow-level `console` working directory
+    # does not exist for it.
+    defaults:
+      run:
+        working-directory: .
+    env:
+      MANIFEST: ${{ needs.resolve.outputs.manifest }}
+    steps:
+      - name: Verify every channel manifest is present
+        # The manifests are what auto-update reads. Publishing without one is the
+        # exact failure this job exists to prevent, so check rather than trust
+        # that the upload steps ran.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          echo "$assets"
+          missing=""
+          for required in "$MANIFEST-mac.yml" "$MANIFEST-linux.yml" "$MANIFEST-linux-arm64.yml" "$MANIFEST.yml"; do
+            printf '%s\n' "$assets" | grep -qx "$required" || missing="$missing $required"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Refusing to publish $GITHUB_REF_NAME — missing channel manifest(s):$missing. The Release stays a draft; re-run the failed platform job."
+            exit 1
+          fi
+
+      - name: Verify the macOS manifest covers both architectures
+        # Presence is not enough for macOS: both mac builds write the same channel file,
+        # so a single-arch manifest is what a regression here looks like — and it
+        # is silent, because the architecture that is missing keeps checking for
+        # updates and simply never finds one it can install.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$MANIFEST-mac.yml" \
+            --dir "$RUNNER_TEMP"
+          cat "$RUNNER_TEMP/$MANIFEST-mac.yml"
+          missing=""
+          for required in -arm64.zip -x64.zip; do
+            grep -q "url: .*$required$" "$RUNNER_TEMP/$MANIFEST-mac.yml" || missing="$missing $required"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Refusing to publish $GITHUB_REF_NAME — $MANIFEST-mac.yml lists no:$missing. That architecture would receive no further updates, without an error anywhere. The Release stays a draft."
+            exit 1
+          fi
+
+      - name: Publish
+        if: needs.resolve.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
+
+      - name: Publish (canary prerelease)
+        if: needs.resolve.outputs.channel == 'canary'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease \
+            --latest=false
+
+      - name: Verify the canary is a prerelease and not Latest
+        # Stable installs update from whichever Release GitHub calls Latest. A
+        # canary that became Latest would be the stable feed, so this is checked
+        # against GitHub itself, and a canary that fails it goes back to draft.
+        if: needs.resolve.outputs.channel == 'canary'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)"
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          echo "isPrerelease=$prerelease latest=$latest"
+          if [ "$prerelease" != "true" ] || [ "$latest" = "$GITHUB_REF_NAME" ]; then
+            echo "::error::$GITHUB_REF_NAME was published as a stable-visible release (isPrerelease=$prerelease, Latest=$latest). Reverting it to a draft."
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=true
+            exit 1
+          fi
+
+  # Keeps the Releases page and the canary feed short: only the newest canaries
+  # stay. Matches bare `v<semver>-canary.` tags only, so a stable
+  # `switch-console-v*` or core `switch-v*` release can never be selected.
+  prune-canaries:
+    name: Prune old canary releases
+    runs-on: ubuntu-latest
+    needs: [resolve, publish-release]
+    if: needs.resolve.outputs.channel == 'canary'
+    defaults:
+      run:
+        working-directory: .
+    env:
+      KEEP: 5
+    steps:
+      - name: Delete all but the newest canaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          stale="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,isPrerelease,isDraft,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-canary\\.")))]
+                  | sort_by(.createdAt) | reverse | .['"$KEEP"':] | .[].tagName')"
+          if [ -z "$stale" ]; then
+            echo "Nothing to prune."
+            exit 0
+          fi
+          printf '%s\n' "$stale" | while IFS= read -r tag; do
+            echo "Deleting $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
