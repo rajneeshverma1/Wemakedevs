@@ -1,0 +1,15 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+*.pyc
+**/node_modules
+# Rebuilt inside the image; a local build is only context to upload.
+gateway/dist
+internal/deploy/terraform/.terraform
+deploy/remote/helm/switch/charts
+.claude
+.env
+.env.*
+*.tfstate*
+related-projects
