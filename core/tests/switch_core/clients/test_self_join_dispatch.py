@@ -1,0 +1,133 @@
+"""The self-join hook must still fire when the client joined the room itself.
+
+`join_room` records membership as soon as the join returns so `wait_joined` is
+accurate (CHOO-1781). Auto-accepting an invite goes through it, so by the time the join arrives over sync the room is already
+in `room_join_times` — CHOO-2170: gating the hook on that made the agent
+greeting unreachable on every room an agent is invited to, which is all of them.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from switch_core.clients.actor import Actor
+from switch_core.clients.consumer import Consumer
+from switch_core.transport import InboundMembership, RoomRef
+
+TRANSPORT_ROOM_ID = "!matrix:switch.local"
+SELF = "@switch-agent-1:switch.local"
+
+
+class _Client(Consumer):
+    def __init__(self) -> None:
+        actor = Actor.__new__(Actor)
+        actor.transport_user_id = SELF
+        actor.client_id = "client-1"
+        actor.display_name = "client one"
+        actor.room_join_times = {}
+        actor._room_joined_events = {}
+        self.actor = actor
+        self._self_join_dispatched = set()
+        self.self_joins: list[str] = []
+        self.member_events: list[str] = []
+
+    async def on_self_join(self, room, event) -> None:
+        self.self_joins.append(room.room_id)
+
+    async def on_member_event(self, room, event) -> None:
+        self.member_events.append(event.state_key)
+
+
+def _room() -> RoomRef:
+    return RoomRef(room_id=TRANSPORT_ROOM_ID)
+
+
+def _member_event(
+    *,
+    state_key: str = SELF,
+    membership: str = "join",
+    prev_membership: str | None = "invite",
+    timestamp: int = 2000,
+) -> InboundMembership:
+    return InboundMembership(
+        room_id=TRANSPORT_ROOM_ID,
+        event_id="$member",
+        sender=state_key,
+        timestamp=timestamp,
+        state_key=state_key,
+        membership=membership,
+        prev_membership=prev_membership,
+    )
+
+
+@pytest.mark.asyncio
+async def test_self_join_fires_after_the_client_joined_itself() -> None:
+    client = _Client()
+    # Auto-accepting the invite records membership before sync reports the join.
+    client.actor.mark_joined(TRANSPORT_ROOM_ID, 1500)
+
+    await client._handle_member_event(_room(), _member_event())
+
+    assert client.self_joins == [TRANSPORT_ROOM_ID]
+
+
+@pytest.mark.asyncio
+async def test_self_join_fires_only_once_for_the_same_join() -> None:
+    client = _Client()
+    event = _member_event()
+
+    await client._handle_member_event(_room(), event)
+    await client._handle_member_event(_room(), event)
+
+    assert client.self_joins == [TRANSPORT_ROOM_ID]
+
+
+@pytest.mark.asyncio
+async def test_profile_update_is_not_an_arrival() -> None:
+    """A display-name change re-fires m.room.member with membership == join."""
+    client = _Client()
+
+    await client._handle_member_event(
+        _room(), _member_event(prev_membership="join", timestamp=3000)
+    )
+
+    assert client.self_joins == []
+
+
+@pytest.mark.asyncio
+async def test_a_join_handed_over_late_is_still_announced() -> None:
+    """Whether a join is news is the cursor's call, not the clock's. A join
+    the client had not handled when its last reader stopped is handed to the
+    next one, however long ago it was, and is announced there."""
+    client = _Client()
+
+    await client._handle_member_event(_room(), _member_event(timestamp=500))
+
+    assert client.self_joins == [TRANSPORT_ROOM_ID]
+
+
+@pytest.mark.asyncio
+async def test_rejoining_after_leaving_is_a_fresh_arrival() -> None:
+    client = _Client()
+
+    await client._handle_member_event(_room(), _member_event())
+    await client._handle_member_event(
+        _room(),
+        _member_event(membership="leave", prev_membership="join", timestamp=3000),
+    )
+    await client._handle_member_event(
+        _room(), _member_event(prev_membership="leave", timestamp=4000)
+    )
+
+    assert client.self_joins == [TRANSPORT_ROOM_ID, TRANSPORT_ROOM_ID]
+
+
+@pytest.mark.asyncio
+async def test_another_member_joining_is_not_a_self_join() -> None:
+    client = _Client()
+    other = "@switch-agent-2:switch.local"
+
+    await client._handle_member_event(_room(), _member_event(state_key=other))
+
+    assert client.self_joins == []
+    assert client.member_events == [other]

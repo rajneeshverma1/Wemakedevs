@@ -1,0 +1,270 @@
+"""An admin can link a messaging identity only to a member of their own tenant.
+
+`users` is deployment-wide, so a user id that exists is not necessarily one
+this tenant has any business recognising. The claim decides who an account is
+treated as inside the tenant — owner-only addressing reads it — so the target
+must be a member, and a non-member gets the same 404 as an id that does not
+exist. Either way the link only waits for the account to confirm it
+(CHOO-3881); nobody is recognised by it yet.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.collaboration.models import DirectoryUser
+from switch_core.db.models import (
+    TENANT_ZERO_ID,
+    Client,
+    CollaborationBridge,
+    ExternalUser,
+    Tenant,
+    TenantMember,
+    User,
+)
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.collaborations import claim_bridge_identity
+from switch_core.gateway.schemas import ClaimIdentityRequest
+
+_EXTERNAL_USERS = ExternalUserStore()
+
+
+class _Lifecycle:
+    """What a claim asks of a running bridge, for a platform where any account
+    can be linked."""
+
+    def get_adapter(self, _bridge_id: str) -> _Lifecycle:
+        return self
+
+    async def account_unlinkable_reason(self, _external_user_id: str) -> None:
+        return None
+
+    def link_code_instructions(
+        self, _bridge_type: str, _connection_config: object, code: str
+    ) -> str:
+        return f"Post `!link-account {code}`."
+
+
+async def _make_client(session: AsyncSession, client_type: str) -> str:
+    client = Client(
+        transport_user_id=f"@{client_type}-{uuid.uuid4().hex[:8]}:test",
+        display_name=client_type,
+        type=client_type,
+    )
+    session.add(client)
+    await session.flush()
+    return client.id
+
+
+async def _make_user(session: AsyncSession, *, tenant_id: str, role: str) -> User:
+    name = f"user-{uuid.uuid4().hex[:8]}"
+    user = User(name=name, email=f"{name}@test", role="user", password_hash="x")
+    session.add(user)
+    await session.flush()
+    session.add(TenantMember(tenant_id=tenant_id, user_id=user.id, role=role))
+    await session.flush()
+    return user
+
+
+async def _setup(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[str, ExternalUser, User, User, User]:
+    other_tenant = f"tenant-{uuid.uuid4().hex[:8]}"
+    async with session_factory() as session:
+        session.add(Tenant(id=other_tenant, slug=other_tenant, name=other_tenant))
+        await session.flush()
+        bridge = CollaborationBridge(
+            type="mattermost",
+            display_name="MM",
+            client_id=await _make_client(session, "bridge"),
+            status="active",
+        )
+        session.add(bridge)
+        await session.flush()
+        external_user = ExternalUser(
+            bridge_id=bridge.id,
+            external_user_id=f"U{uuid.uuid4().hex[:8]}",
+            external_username="alice",
+            client_id=await _make_client(session, "external_user"),
+        )
+        session.add(external_user)
+        admin = await _make_user(session, tenant_id=TENANT_ZERO_ID, role="admin")
+        member = await _make_user(session, tenant_id=TENANT_ZERO_ID, role="member")
+        outsider = await _make_user(session, tenant_id=other_tenant, role="admin")
+        await session.commit()
+        return bridge.id, external_user, admin, member, outsider
+
+
+async def _claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    bridge_id: str,
+    external_user: ExternalUser,
+    caller: User,
+    target_user_id: str,
+) -> object:
+    async with session_factory() as session:
+        return await claim_bridge_identity(
+            bridge_id,
+            ClaimIdentityRequest(
+                external_user_id=external_user.external_user_id,
+                username=external_user.external_username,
+                user_id=target_user_id,
+                expects_confirmation=True,
+            ),
+            session,
+            CollaborationBridgeStore(),
+            _EXTERNAL_USERS,
+            UserStore(),
+            _Lifecycle(),  # type: ignore[arg-type]
+            caller,
+            True,
+        )
+
+
+async def test_admin_cannot_claim_an_identity_for_another_tenants_user(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bridge_id, external_user, admin, _member, outsider = await _setup(session_factory)
+
+    with pytest.raises(HTTPException) as refused:
+        await _claim(
+            session_factory,
+            bridge_id=bridge_id,
+            external_user=external_user,
+            caller=admin,
+            target_user_id=outsider.id,
+        )
+
+    assert refused.value.status_code == 404
+    async with session_factory() as session:
+        assert await _EXTERNAL_USERS.claimant_ids(session, external_user.id) == []
+        assert (
+            await _EXTERNAL_USERS.get_link_request(
+                session, external_user.id, outsider.id
+            )
+            is None
+        )
+
+
+async def test_admin_can_start_linking_an_identity_to_a_member(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bridge_id, external_user, admin, member, _outsider = await _setup(session_factory)
+
+    summary = await _claim(
+        session_factory,
+        bridge_id=bridge_id,
+        external_user=external_user,
+        caller=admin,
+        target_user_id=member.id,
+    )
+
+    # The admin never sees the code: the member gets their own.
+    assert summary.link_request is not None  # type: ignore[attr-defined]
+    assert summary.link_request.user_id == member.id  # type: ignore[attr-defined]
+    assert summary.link_request.code is None  # type: ignore[attr-defined]
+    async with session_factory() as session:
+        assert await _EXTERNAL_USERS.claimant_ids(session, external_user.id) == []
+        request = await _EXTERNAL_USERS.get_link_request(
+            session, external_user.id, member.id
+        )
+        assert request is not None
+        assert request.requested_by_user_id == admin.id
+        assert request.code_hash is None
+
+
+class _ProvisioningLifecycle:
+    """A running bridge whose directory lists one account Switch has not seen,
+    and which records it, from its own session, when asked to."""
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        bridge_id: str,
+        external_user_id: str,
+    ) -> None:
+        self._session_factory = session_factory
+        self._bridge_id = bridge_id
+        self._external_user_id = external_user_id
+
+    def get_adapter(self, _bridge_id: str) -> _ProvisioningLifecycle:
+        return self
+
+    def get(self, _bridge_id: str) -> _ProvisioningLifecycle:
+        return self
+
+    async def account_unlinkable_reason(self, _external_user_id: str) -> None:
+        return None
+
+    def link_code_instructions(
+        self, _bridge_type: str, _connection_config: object, code: str
+    ) -> str:
+        return f"Post `!link-account {code}`."
+
+    async def search_directory_users(self, _query: str) -> list[DirectoryUser]:
+        return [
+            DirectoryUser(
+                external_user_id=self._external_user_id,
+                username="user",
+                display_name="User",
+                email=None,
+            )
+        ]
+
+    async def ensure_external_user(
+        self, *, external_user_id: str, external_username: str
+    ) -> ExternalUser:
+        async with self._session_factory() as session:
+            external_user = ExternalUser(
+                bridge_id=self._bridge_id,
+                external_user_id=external_user_id,
+                external_username=external_username,
+                client_id=await _make_client(session, "external_user"),
+            )
+            session.add(external_user)
+            await session.commit()
+            return external_user
+
+
+async def test_claiming_an_account_switch_has_not_seen_starts_linking_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # What a fresh deployment does on its first run: the seeded admin claims
+    # the seeded chat account before it has ever spoken. The caller is loaded
+    # in the request's own session, as authentication loads it.
+    bridge_id, _seen, admin, _member, _outsider = await _setup(session_factory)
+    unseen = f"U{uuid.uuid4().hex[:8]}"
+
+    async with session_factory() as session:
+        caller = await session.get(User, admin.id)
+        assert caller is not None
+        summary = await claim_bridge_identity(
+            bridge_id,
+            ClaimIdentityRequest(
+                external_user_id=unseen, username="user", expects_confirmation=True
+            ),
+            session,
+            CollaborationBridgeStore(),
+            _EXTERNAL_USERS,
+            UserStore(),
+            _ProvisioningLifecycle(session_factory, bridge_id, unseen),  # type: ignore[arg-type]
+            caller,
+            True,
+        )
+
+    async with session_factory() as session:
+        provisioned = await _EXTERNAL_USERS.get_by_external_id(
+            session, bridge_id, unseen
+        )
+        assert provisioned is not None
+        assert await _EXTERNAL_USERS.claimant_ids(session, provisioned.id) == []
+        assert await _EXTERNAL_USERS.get_link_request(session, provisioned.id, admin.id)
+    assert summary.link_request is not None
+    assert summary.link_request.code is not None

@@ -1,0 +1,311 @@
+"""CHOO-2067 — what an agent's message looks like once it reaches Teams.
+
+Three faults, all seen in one screenshot from switch-dev: a Slack-shaped
+`<@28:11111111-…>` printed at the reader, an `@name` that highlighted nobody,
+and a heading running into the line beneath it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from switch_core.bridges.collaboration.adapter import AgentRendering
+from switch_core.bridges.collaboration.teams.adapter import (
+    TeamsAdapter,
+    TeamsConnectionConfig,
+    _hard_wrap,
+)
+from switch_core.bridges.collaboration.teams.cards import (
+    agent_message_card,
+    card_attachment,
+)
+from switch_core.bridges.collaboration.teams.connector import _payload
+
+_RENDERING = AgentRendering(
+    field_label="james", body_label="james", icon_url="http://icon"
+)
+
+
+def _run(coro: Any) -> Any:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _adapter(**targets: str) -> TeamsAdapter:
+    adapter = TeamsAdapter(
+        config=TeamsConnectionConfig(
+            app_id="app-123",
+            app_password="secret",
+            tenant_id="tenant-9",
+            team_id="team-7",
+            public_base_url="https://switch.example",
+            client_state="s3cr3t",
+        )
+    )
+    if targets:
+        adapter.prime_mention_targets(dict(targets))
+    return adapter
+
+
+# ── @mentions ────────────────────────────────────────────────────────────────
+
+
+def test_a_known_person_becomes_real_mention_markup() -> None:
+    adapter = _adapter(alice="aad-alice")
+
+    assert adapter.translate_outbound("hi @alice") == "hi <at>alice</at>"
+
+
+def test_the_markup_is_matched_by_an_entity_or_it_highlights_nobody() -> None:
+    adapter = _adapter(alice="aad-alice")
+    body = adapter.translate_outbound("hi @alice")
+
+    assert adapter._mention_entities(body) == [
+        {
+            "type": "mention",
+            "text": "<at>alice</at>",
+            "mentioned": {"id": "aad-alice", "name": "alice"},
+        }
+    ]
+
+
+def test_mention_matching_ignores_case() -> None:
+    adapter = _adapter(Alice="aad-alice")
+
+    assert adapter.translate_outbound("hi @alice") == "hi <at>alice</at>"
+
+
+def test_an_unknown_name_is_left_alone() -> None:
+    # Agent names land here: an agent is not a Teams user, and Switch's own
+    # addressing wants the plain `@name`. Marking it would render a mention
+    # that highlights nobody.
+    adapter = _adapter(alice="aad-alice")
+
+    assert adapter.translate_outbound("ask @james about it") == ("ask @james about it")
+    assert adapter._mention_entities("ask @james about it") == []
+
+
+def test_a_name_repeated_gets_one_entity() -> None:
+    adapter = _adapter(alice="aad-alice")
+    body = adapter.translate_outbound("@alice ping @alice again")
+
+    assert body.count("<at>alice</at>") == 2
+    assert len(adapter._mention_entities(body)) == 1
+
+
+def test_a_handle_with_a_space_in_it_is_still_a_mention() -> None:
+    # The reported bug. Teams offers a display name for people whose principal
+    # name we cannot read, so the handle we file them under is two words. A
+    # matcher that stops at the space sees `@Louis` and finds nobody, and the
+    # person gets flat text and no notification.
+    adapter = _adapter(**{"Louis Amaudruz": "aad-louis"})
+    body = adapter.translate_outbound("@Louis Amaudruz starting a session")
+
+    assert body == "<at>Louis Amaudruz</at> starting a session"
+    assert adapter._mention_entities(body) == [
+        {
+            "type": "mention",
+            "text": "<at>Louis Amaudruz</at>",
+            "mentioned": {"id": "aad-louis", "name": "Louis Amaudruz"},
+        }
+    ]
+
+
+def test_the_longest_known_name_wins() -> None:
+    # Both are addressable, so matching the shorter one first would tag the
+    # wrong person and leave "Amaudruz" dangling as text.
+    adapter = _adapter(**{"Louis": "aad-other", "Louis Amaudruz": "aad-louis"})
+
+    assert adapter.translate_outbound("@Louis Amaudruz") == "<at>Louis Amaudruz</at>"
+    assert adapter.translate_outbound("@Louis alone") == "<at>Louis</at> alone"
+
+
+def test_a_known_name_is_not_matched_inside_a_longer_one() -> None:
+    adapter = _adapter(ada="aad-ada")
+
+    assert adapter.translate_outbound("@adaline wrote it") == "@adaline wrote it"
+
+
+def test_a_name_learned_later_is_matched_from_then_on() -> None:
+    # The matcher is built from the targets, so it has to be rebuilt when a
+    # person is met for the first time mid-session.
+    adapter = _adapter(alice="aad-alice")
+    assert adapter.translate_outbound("hi @bob") == "hi @bob"
+
+    adapter.prime_mention_targets({"bob": "aad-bob"})
+
+    assert adapter.translate_outbound("hi @bob") == "hi <at>bob</at>"
+
+
+def test_the_card_carries_mentions_where_teams_looks_for_them() -> None:
+    # On a card the entities live under `msteams`, not on the activity.
+    adapter = _adapter(alice="aad-alice")
+    body = adapter.translate_outbound("hi @alice")
+
+    activity = _run(adapter._message_activity("james", body, []))
+    card = activity["attachments"][0]["content"]
+
+    assert card["msteams"]["entities"][0]["mentioned"]["id"] == "aad-alice"
+
+
+def test_a_card_with_no_mentions_carries_no_msteams_block() -> None:
+    assert "msteams" not in agent_message_card(_RENDERING, "hello", [], [])
+
+
+def test_a_sender_with_no_icon_gets_no_image_element() -> None:
+    """An Image with no url is an invalid card, and Teams drops the whole post."""
+    rendering = AgentRendering(field_label="james", body_label="james", icon_url=None)
+    card = agent_message_card(rendering, "hello", [], [])
+    header = card["body"][0]
+    assert [item["type"] for col in header["columns"] for item in col["items"]] == [
+        "TextBlock"
+    ]
+
+
+# ── the app's own handle ─────────────────────────────────────────────────────
+
+
+def test_the_app_is_named_in_words_not_in_slack_syntax() -> None:
+    # This is the `<@28:11111111-…>` from the screenshot. Teams has no inline
+    # syntax that turns its app id into a mention, so printing one at the
+    # reader is strictly worse than saying "me".
+    adapter = _adapter()
+
+    rendered = adapter.render_app_mention("28:11111111-2222-3333-4444-555555555555")
+
+    assert rendered == "me"
+    assert "<@" not in rendered
+
+
+# ── line breaks ──────────────────────────────────────────────────────────────
+
+
+def _lines(body: str) -> list[tuple[str, str]]:
+    """Every body block of the card, as (spacing, text)."""
+    card = agent_message_card(_RENDERING, body, [], [])
+    return [(str(block["spacing"]), str(block["text"])) for block in card["body"][1:]]
+
+
+def test_a_single_newline_survives() -> None:
+    # Adaptive Cards follow Markdown: one newline is whitespace. This is the
+    # heading that ran into the sentence under it. It gets its break from a
+    # block of its own, so the line beneath sits under it rather than a
+    # paragraph away.
+    assert _lines("**Heading:**\nbody") == [
+        ("Small", "**Heading:**"),
+        ("None", "body"),
+    ]
+
+
+def test_a_gap_the_body_asked_for_is_the_only_gap_there_is() -> None:
+    assert _lines("one\ntwo\n\nthree") == [
+        ("Small", "one"),
+        ("None", "two"),
+        ("Small", "three"),
+    ]
+
+
+def test_list_items_stay_in_one_block_so_they_stay_one_list() -> None:
+    # Split a block apiece and each item is its own one-item list, which
+    # restarts the numbering and indents each one separately.
+    assert _lines("pick one:\n1. one\n2. two") == [
+        ("Small", "pick one:"),
+        ("None", "1. one\n2. two"),
+    ]
+
+
+def test_a_body_with_no_newlines_is_one_block() -> None:
+    assert _lines("just a sentence") == [("Small", "just a sentence")]
+
+
+def test_a_body_of_many_short_lines_is_not_refused_for_its_punctuation() -> None:
+    """Five hundred short lines is about a thousand characters of message.
+
+    Set a line to a block it was seventy kilobytes of JSON braces, past the
+    connector's limit, and the whole message was refused — for the shape it
+    was drawn in rather than for anything the sender wrote. Every line is
+    still here and still on a line of its own; the gaps between them widen.
+    """
+    body = "\n".join(f"line {n}" for n in range(500))
+    card = agent_message_card(_RENDERING, body, [], [])
+
+    assert len(card["body"][1:]) == 1
+    text = str(card["body"][1]["text"])
+    assert text.startswith("line 0\n\nline 1\n\n")
+    assert text.endswith("line 499")
+    _payload("send", {"type": "message", "attachments": [card_attachment(card)]})
+
+
+def test_a_body_short_enough_to_afford_its_blocks_still_gets_them() -> None:
+    body = "\n".join(f"line {n}" for n in range(20))
+
+    assert _lines(body)[:2] == [("Small", "line 0"), ("None", "line 1")]
+    assert len(_lines(body)) == 20
+
+
+def test_the_text_itself_is_left_alone() -> None:
+    # The breaks are the card's doing, so nothing is written into the body to
+    # get them — and `fallbackText`, which no card renders, is the body as the
+    # agent wrote it.
+    adapter = _adapter()
+    body = "**Heading:**\nbody"
+
+    assert adapter.translate_outbound(body) == body
+    assert agent_message_card(_RENDERING, body, [], [])["fallbackText"].endswith(body)
+
+
+def test_the_plain_text_seam_still_doubles_because_it_has_no_blocks() -> None:
+    # An admin message is Teams speaking as itself: a plain-text activity, no
+    # Adaptive Card, and so nowhere to put a line break but the text. A
+    # paragraph gap per break is worse than a block and far better than the
+    # run-on sentence this started as.
+    assert _hard_wrap("**Heading:**\nbody") == "**Heading:**\n\nbody"
+    assert _hard_wrap("one\n\ntwo") == "one\n\ntwo"
+
+
+# ── translated once, not twice ───────────────────────────────────────────────
+
+
+def test_send_message_does_not_translate_again() -> None:
+    # Callers of send_message translate first, by documented contract. The
+    # adapter used to translate a second time, which is invisible while
+    # translation is a no-op and corrupting the moment it is not — re-marking
+    # text that was already marked.
+    adapter = _adapter(alice="aad-alice")
+    already = adapter.translate_outbound("hi @alice\nthere")
+
+    activity = _run(adapter._message_activity("james", already, []))
+    blocks = activity["attachments"][0]["content"]["body"][1:]
+
+    assert [block["text"] for block in blocks] == ["hi <at>alice</at>", "there"]
+    assert "<at><at>" not in already
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+
+def test_both_command_prefixes_name_the_same_command() -> None:
+    # Teams has no server-registered slash commands: a manifest command list
+    # types the text into the compose box, so `/help` arrives as an ordinary
+    # message. By the time we see it the two prefixes are the same thing.
+    assert TeamsAdapter._command_name("!list-agents") == "list-agents"
+    assert TeamsAdapter._command_name("/list-agents") == "list-agents"
+
+
+def test_a_bare_word_is_not_mistaken_for_a_command_name() -> None:
+    assert TeamsAdapter._command_name("list-agents") == "list-agents"
+
+
+def test_the_invite_hint_offers_the_slash_form_unconditionally() -> None:
+    hint = _adapter().slash_invite_hint()
+
+    assert hint is not None
+    assert "/invite-agent" in hint
+    # Teams has no server-registered slash commands, so `/` is just a message
+    # prefix the bot parses. It works whether or not the operator has declared
+    # a command list, and the hint must not imply otherwise.
+    assert "manifest" not in hint

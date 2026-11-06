@@ -1,0 +1,144 @@
+"""End-to-end test for the agent self-join greeting over the real transport.
+
+Drives the genuine path: RoomService creates a room and invites the agent,
+provisioning writes the agent's membership and its arrival, and the router,
+deciding the arrival, posts the greeting on the agent's behalf once it has
+committed. The assertion reads the room timeline back out of the messages table,
+so nothing is inferred from in-process state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from switch_core.db.models import Agent, CollaborationBridge, Message, Room
+from switch_core.room_service import RoomCreateConfig
+from tests.integration.conftest import Harness, SessionEnv
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
+
+
+async def _wait_joined(
+    client: object, transport_room_id: str, timeout: float = 30
+) -> None:
+    """Block until the agent is a member of the room: its membership is a
+    row, written when it was invited (`Actor.wait_joined` reads it)."""
+    assert await client.wait_joined(transport_room_id, timeout), (  # type: ignore[attr-defined]
+        f"client never joined {transport_room_id} within {timeout}s"
+    )
+
+
+async def _timeline_messages(
+    harness: Harness, session_env: SessionEnv, room_id: str
+) -> list[Message]:
+    """Every m.room.message in the room, read back out of the messages table."""
+    async with harness.session_factory() as session:  # type: ignore[operator]
+        rows = await session_env.message_store.list_for_room(
+            session, room_id, after_seq=0, limit=100
+        )
+    return [row for row in rows if row.event_type == "m.room.message"]
+
+
+async def _wait_for_message_from(
+    harness: Harness,
+    session_env: SessionEnv,
+    room_id: str,
+    sender_localpart: str,
+    timeout: float = 20,
+) -> Message | None:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        for row in await _timeline_messages(harness, session_env, room_id):
+            if row.sender_id.startswith(f"@{sender_localpart}"):
+                return row
+        await asyncio.sleep(0.5)
+    return None
+
+
+async def test_agent_posts_greeting_on_join(
+    harness: Harness, session_env: SessionEnv
+) -> None:
+    agent = await harness.register_agent("e2e-greeter")
+    await harness.start_clients()
+    client = harness.client_for(agent.agent_id)
+    await client.wait_ready()
+
+    result = await harness.room_service.create_room(
+        RoomCreateConfig(
+            name="e2e-greeting-room",
+            description="integration self-join greeting test",
+            agent_ids=[agent.agent_id],
+        )
+    )
+    transport_room_id = result.room.transport_room_id
+    await _wait_joined(client, transport_room_id)
+
+    greeting = await _wait_for_message_from(
+        harness,
+        session_env,
+        result.room.id,
+        client.transport_user_id.split(":")[0].lstrip("@"),
+    )
+
+    assert greeting is not None, (
+        "agent joined the room but never posted a self-join greeting"
+    )
+    assert "e2e-greeter" in greeting.content["body"]
+
+
+async def test_no_greeting_when_the_bridge_has_them_disabled(
+    harness: Harness, session_env: SessionEnv
+) -> None:
+    """The per-connection toggle still wins over the arrival."""
+    host = await harness.register_agent("e2e-quiet-host")
+    joiner = await harness.register_agent("e2e-quiet-joiner")
+    await harness.start_clients()
+    joiner_client = harness.client_for(joiner.agent_id)
+
+    result = await harness.room_service.create_room(
+        RoomCreateConfig(
+            name="e2e-quiet-room",
+            description="integration greeting-toggle test",
+            agent_ids=[host.agent_id],
+        )
+    )
+    transport_room_id = result.room.transport_room_id
+    await _wait_joined(harness.client_for(host.agent_id), transport_room_id)
+
+    # Point the room at a connection with greetings turned off. Done after
+    # creation because the harness runs no collaboration bridge — the join path
+    # only ever reads the room's bridge row, which is what is under test.
+    async with harness.session_factory() as session:
+        host_agent = await session.get(Agent, host.agent_id)
+        session.add(
+            CollaborationBridge(
+                id="quiet-bridge",
+                type="mattermost",
+                display_name="Quiet",
+                client_id=host_agent.client_id,
+                status="active",
+                agent_greetings_enabled=False,
+            )
+        )
+        room = await session.get(Room, result.room.id)
+        room.bridge_id = "quiet-bridge"
+        await session.commit()
+
+    await harness.room_service.add_agents_to_room(
+        result.room.id, agent_ids=[joiner.agent_id]
+    )
+    await _wait_joined(joiner_client, transport_room_id)
+
+    greeting = await _wait_for_message_from(
+        harness,
+        session_env,
+        result.room.id,
+        joiner_client.transport_user_id.split(":")[0].lstrip("@"),
+        timeout=8,
+    )
+
+    assert greeting is None, (
+        f"greeting posted despite the connection having them disabled: {greeting}"
+    )

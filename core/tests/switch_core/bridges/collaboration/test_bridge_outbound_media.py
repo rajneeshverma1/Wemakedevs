@@ -1,0 +1,500 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+from switch_core.bridges.collaboration.collaboration_core import CollaborationCore
+from switch_core.transport import (
+    DownloadResult,
+    InboundMedia,
+    RoomRef,
+    TransportError,
+)
+from tests.switch_core.bridges.collaboration.outbound_fakes import (
+    posting_without_a_database,
+)
+
+
+def _media_event(
+    *,
+    msgtype: str = "m.image",
+    body: str = "cat.png",
+    filename: str | None = None,
+    sender: str = "@agent:s",
+    sender_name: str | None = "agent-a",
+    thread_root: str | None = None,
+    group: dict[str, Any] | None = None,
+    mimetype: str = "image/png",
+    event_id: str = "$media-event",
+) -> InboundMedia:
+    content: dict[str, Any] = {
+        "msgtype": msgtype,
+        "body": body,
+        "url": "mxc://s/abc",
+        "info": {"mimetype": mimetype, "size": 5},
+    }
+    if group is not None:
+        content["com.switch.attachment_group"] = group
+    if filename is not None:
+        content["filename"] = filename
+    if sender_name is not None:
+        content["sender_name"] = sender_name
+    if thread_root is not None:
+        content["m.relates_to"] = {"rel_type": "m.thread", "event_id": thread_root}
+    return InboundMedia(
+        room_id="!room:s",
+        event_id=event_id,
+        sender=sender,
+        timestamp=1700000000000,
+        content=content,
+        body=body,
+        sender_name=sender_name,
+        msgtype=msgtype,
+        uri="mxc://s/abc",
+        filename=filename or body,
+        mimetype=mimetype,
+        size=5,
+        thread_root_id=thread_root,
+        group=group,
+    )
+
+
+class _FakeAdapter:
+    def __init__(self) -> None:
+        self.attachments: list[dict[str, Any]] = []
+        self.batches: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
+
+    async def send_attachment(
+        self,
+        channel_id,
+        sender_name,
+        filename,
+        mimetype,
+        data,
+        caption=None,
+        thread_root_id=None,
+    ):  # noqa: ANN001, ANN201
+        self.attachments.append(
+            {
+                "channel_id": channel_id,
+                "sender_name": sender_name,
+                "filename": filename,
+                "mimetype": mimetype,
+                "data": data,
+                "caption": caption,
+                "thread_root_id": thread_root_id,
+            }
+        )
+        return "ext-ref-1"
+
+    async def send_attachments(
+        self, channel_id, sender_name, files, caption=None, thread_root_id=None
+    ):  # noqa: ANN001, ANN201
+        self.batches.append(
+            {
+                "channel_id": channel_id,
+                "sender_name": sender_name,
+                "files": files,
+                "caption": caption,
+                "thread_root_id": thread_root_id,
+            }
+        )
+        return "ext-ref-3"
+
+    async def send_message(self, channel_id, sender_name, content, thread_root_id=None):  # noqa: ANN001, ANN201
+        self.messages.append(
+            {
+                "channel_id": channel_id,
+                "sender_name": sender_name,
+                "content": content,
+                "thread_root_id": thread_root_id,
+            }
+        )
+        return "ext-ref-2"
+
+    def translate_outbound(self, content: str) -> str:
+        return content
+
+
+def _fake_bridge(
+    *,
+    download: DownloadResult | TransportError = DownloadResult(body=b"bytes"),
+    room_to_external: dict[str, str] | None = None,
+    max_bytes: int = 1024,
+) -> SimpleNamespace:
+    adapter = _FakeAdapter()
+    lookup = room_to_external or {}
+
+    async def _external_post_for_event(transport_event_id: str) -> str | None:
+        return lookup.get(transport_event_id)
+
+    async def _room_tenant(room_id: str) -> str:
+        return "tenant-1"
+
+    ns = SimpleNamespace(
+        _bridge_type="slack",
+        _adapter=adapter,
+        _human_user_ids={"@human actor:s"},
+        _workspace_consumer_transport_user_id="@bridge:s",
+        _max_attachment_bytes=max_bytes,
+        _external_post_for_event=_external_post_for_event,
+        _outbound_groups={},
+        _outbound_group_timers={},
+        _flushing_outbound_groups=[],
+        _channel_to_room={"chan-1": ("room-uuid", "!room:s")},
+        _room_tenant=_room_tenant,
+    )
+    ns.recorded = posting_without_a_database(ns)
+    ns._find_channel = lambda room_id=None, transport_room_id=None: (
+        "chan-1" if transport_room_id == "!room:s" else None
+    )
+    ns._outbound_thread_root_ref = CollaborationCore._outbound_thread_root_ref.__get__(
+        ns
+    )
+    ns._download_media = CollaborationCore._download_media.__get__(ns)
+    ns._schedule_outbound_group_flush = (
+        CollaborationCore._schedule_outbound_group_flush.__get__(ns)
+    )
+    ns._cancel_outbound_group_flush = (
+        CollaborationCore._cancel_outbound_group_flush.__get__(ns)
+    )
+    ns._relay_outbound_group = CollaborationCore._relay_outbound_group.__get__(ns)
+    ns._relay_outbound_media = CollaborationCore._relay_outbound_media.__get__(ns)
+    ns._counted_outbound = CollaborationCore._counted_outbound.__get__(ns)
+    ns._flush_incomplete_outbound_group = (
+        CollaborationCore._flush_incomplete_outbound_group.__get__(ns)
+    )
+    ns._flush_outbound_group = CollaborationCore._flush_outbound_group.__get__(ns)
+
+    async def _download_media(uri: str) -> DownloadResult:
+        if isinstance(download, TransportError):
+            raise download
+        return download
+
+    released: list[str] = []
+    ns.released = released
+    ns.client = SimpleNamespace(
+        running=True,
+        transport=SimpleNamespace(
+            download_media=_download_media, held_back_released=released.append
+        ),
+    )
+    return ns
+
+
+def _room() -> RoomRef:
+    return RoomRef("!room:s")
+
+
+async def test_image_relays_via_send_attachment_and_records_map() -> None:
+    bridge = _fake_bridge()
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(), bridge.client
+    )
+
+    assert bridge._adapter.attachments == [
+        {
+            "channel_id": "chan-1",
+            "sender_name": "agent-a",
+            "filename": "cat.png",
+            "mimetype": "image/png",
+            "data": b"bytes",
+            "caption": None,
+            "thread_root_id": None,
+        }
+    ]
+    assert bridge.recorded == [
+        {
+            "external_channel_id": "chan-1",
+            "transport_event_id": "$media-event",
+            "external_post_id": "ext-ref-1",
+        }
+    ]
+
+
+async def test_caption_convention_unpacks_body_and_filename() -> None:
+    bridge = _fake_bridge()
+
+    await CollaborationCore.handle_outbound_media(
+        bridge,
+        _room(),
+        _media_event(body="look at this", filename="plot.png"),
+        bridge.client,
+    )
+
+    sent = bridge._adapter.attachments[0]
+    assert sent["filename"] == "plot.png"
+    assert sent["caption"] == "look at this"
+
+
+async def test_threaded_media_resolves_external_root() -> None:
+    bridge = _fake_bridge(room_to_external={"$root": "ext-root"})
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(thread_root="$root"), bridge.client
+    )
+
+    assert bridge._adapter.attachments[0]["thread_root_id"] == "ext-root"
+
+
+async def test_human_actor_media_is_skipped() -> None:
+    # Media a human actor posted originated on the platform — relaying it back
+    # would echo it.
+    bridge = _fake_bridge()
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(sender="@human actor:s"), bridge.client
+    )
+
+    assert bridge._adapter.attachments == []
+    assert bridge._adapter.messages == []
+
+
+async def test_media_without_sender_name_is_skipped() -> None:
+    bridge = _fake_bridge()
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(sender_name=None), bridge.client
+    )
+
+    assert bridge._adapter.attachments == []
+    assert bridge._adapter.messages == []
+
+
+async def test_non_image_file_relays_natively() -> None:
+    """A .pdf / .md / .csv must upload as a real file, not degrade to a text
+    notice — that was the reported bug."""
+    bridge = _fake_bridge()
+
+    await CollaborationCore.handle_outbound_media(
+        bridge,
+        _room(),
+        _media_event(msgtype="m.file", body="report.pdf", mimetype="application/pdf"),
+        bridge.client,
+    )
+
+    assert bridge._adapter.messages == []
+    assert len(bridge._adapter.attachments) == 1
+    sent = bridge._adapter.attachments[0]
+    assert sent["filename"] == "report.pdf"
+    assert sent["mimetype"] == "application/pdf"
+    assert sent["data"] == b"bytes"
+    assert bridge.recorded[0]["external_post_id"] == "ext-ref-1"
+
+
+async def test_download_failure_posts_disclosed_fallback() -> None:
+    bridge = _fake_bridge(download=TransportError("boom"))
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(), bridge.client
+    )
+
+    assert bridge._adapter.attachments == []
+    assert len(bridge._adapter.messages) == 1
+    assert "couldn't be relayed" in bridge._adapter.messages[0]["content"]
+
+
+async def test_oversize_media_posts_disclosed_fallback() -> None:
+    bridge = _fake_bridge(download=DownloadResult(body=b"too big"), max_bytes=3)
+
+    await CollaborationCore.handle_outbound_media(
+        bridge, _room(), _media_event(), bridge.client
+    )
+
+    assert bridge._adapter.attachments == []
+    assert "couldn't be relayed" in bridge._adapter.messages[0]["content"]
+
+
+async def test_grouped_attachments_relay_as_one_platform_post() -> None:
+    """Three files sent as one message must arrive as ONE post carrying all
+    three, not three separate posts."""
+    bridge = _fake_bridge()
+    group_id = "grp-1"
+
+    for index, (name, mimetype) in enumerate(
+        [
+            ("cat.png", "image/png"),
+            ("notes.md", "text/markdown"),
+            ("data.csv", "text/csv"),
+        ]
+    ):
+        await CollaborationCore.handle_outbound_media(
+            bridge,
+            _room(),
+            _media_event(
+                msgtype="m.image" if index == 0 else "m.file",
+                body="three files" if index == 0 else name,
+                filename=name if index == 0 else None,
+                mimetype=mimetype,
+                event_id=f"$part-{index}",
+                group={"id": group_id, "index": index, "total": 3},
+            ),
+            bridge.client,
+        )
+
+    # Nothing relayed until the group completed.
+    assert bridge._adapter.attachments == []
+    assert bridge._adapter.messages == []
+    assert len(bridge._adapter.batches) == 1
+
+    batch = bridge._adapter.batches[0]
+    assert [f.filename for f in batch["files"]] == ["cat.png", "notes.md", "data.csv"]
+    assert batch["caption"] == "three files"
+    # The group correlates via its first event, so replies thread back.
+    assert bridge.recorded[0]["transport_event_id"] == "$part-0"
+    assert bridge.recorded[0]["external_post_id"] == "ext-ref-3"
+    assert bridge._outbound_groups == {}
+
+
+async def test_incomplete_group_is_flushed_with_a_disclosed_notice() -> None:
+    """A group that never completes must still reach the platform, flagged —
+    never silently held forever."""
+    import switch_core.bridges.collaboration.collaboration_core as bc
+
+    original = bc.OUTBOUND_GROUP_TIMEOUT_SECONDS
+    bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = 0.01
+    try:
+        bridge = _fake_bridge()
+        await CollaborationCore.handle_outbound_media(
+            bridge,
+            _room(),
+            _media_event(
+                msgtype="m.file",
+                body="only.md",
+                mimetype="text/markdown",
+                group={"id": "grp-2", "index": 0, "total": 3},
+            ),
+            bridge.client,
+        )
+        assert bridge._adapter.batches == []
+
+        await asyncio.sleep(0.1)
+    finally:
+        bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = original
+
+    assert len(bridge._adapter.batches) == 1
+    batch = bridge._adapter.batches[0]
+    assert [f.filename for f in batch["files"]] == ["only.md"]
+    assert "1 of 3" in (batch["caption"] or "")
+    assert bridge._outbound_groups == {}
+    # Posted, so the bridge's progress in the room may move past it.
+    assert bridge.released == ["!room:s"]
+
+
+async def test_an_incomplete_group_is_left_to_the_next_holder_once_stopped() -> None:
+    """A bridge that stopped while a group waited for its other files posts
+    nothing: its progress in the room stops before the group's first file,
+    so whichever process holds the bridge next reads the group again."""
+    import switch_core.bridges.collaboration.collaboration_core as bc
+
+    original = bc.OUTBOUND_GROUP_TIMEOUT_SECONDS
+    bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = 0.01
+    try:
+        bridge = _fake_bridge()
+        await CollaborationCore.handle_outbound_media(
+            bridge,
+            _room(),
+            _media_event(
+                msgtype="m.file",
+                body="only.md",
+                mimetype="text/markdown",
+                group={"id": "grp-3", "index": 0, "total": 2},
+            ),
+            bridge.client,
+        )
+        bridge.client.running = False
+
+        await asyncio.sleep(0.1)
+    finally:
+        bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = original
+
+    assert bridge._adapter.batches == []
+    assert bridge.released == []
+
+
+async def test_a_file_arriving_while_its_group_times_out_is_still_posted() -> None:
+    """The timeout posts the files that arrived; one arriving while that post
+    is on its way is posted on its own, not added to a post already sent
+    without it."""
+    import switch_core.bridges.collaboration.collaboration_core as bc
+
+    bridge = _fake_bridge()
+    adapter = bridge._adapter
+    posting = asyncio.Event()
+    posted = asyncio.Event()
+    send_attachments = adapter.send_attachments
+
+    async def slow_send_attachments(*args: Any, **kwargs: Any) -> str:
+        if not posting.is_set():
+            posting.set()
+            await posted.wait()
+        result: str = await send_attachments(*args, **kwargs)
+        return result
+
+    adapter.send_attachments = slow_send_attachments
+    original = bc.OUTBOUND_GROUP_TIMEOUT_SECONDS
+    bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = 0.01
+    try:
+        for index, name in [(0, "first.md"), (1, "late.md")]:
+            await CollaborationCore.handle_outbound_media(
+                bridge,
+                _room(),
+                _media_event(
+                    msgtype="m.file",
+                    body=name,
+                    mimetype="text/markdown",
+                    event_id=f"$part-{index}",
+                    group={"id": "grp-4", "index": index, "total": 2},
+                ),
+                bridge.client,
+            )
+            if index == 0:
+                await asyncio.wait_for(posting.wait(), 1.0)
+        posted.set()
+        await asyncio.sleep(0.1)
+    finally:
+        bc.OUTBOUND_GROUP_TIMEOUT_SECONDS = original
+
+    assert [[f.filename for f in batch["files"]] for batch in adapter.batches] == [
+        ["first.md"],
+        ["late.md"],
+    ]
+    assert bridge._outbound_groups == {}
+    assert bridge._flushing_outbound_groups == []
+
+
+async def test_a_post_cancelled_by_a_stop_lets_its_claim_go() -> None:
+    """A bridge stopping past its grace cancels the post in hand. The claim
+    goes with it, so the next holder, reading the message again, posts it."""
+    bridge = _fake_bridge()
+    sending = asyncio.Event()
+
+    async def hanging_send_attachment(*args: Any, **kwargs: Any) -> str:
+        sending.set()
+        await asyncio.Event().wait()
+        raise AssertionError("never answered")
+
+    bridge._adapter.send_attachment = hanging_send_attachment
+    released: list[str] = []
+    release = bridge._release_outbound
+
+    async def recording_release(transport_event_id: str) -> None:
+        released.append(transport_event_id)
+        await release(transport_event_id)
+
+    bridge._release_outbound = recording_release
+    posting = asyncio.create_task(
+        CollaborationCore.handle_outbound_media(
+            bridge, _room(), _media_event(event_id="$cut-short"), bridge.client
+        )
+    )
+    await asyncio.wait_for(sending.wait(), 1.0)
+
+    posting.cancel()
+    await asyncio.gather(posting, return_exceptions=True)
+
+    assert posting.cancelled()
+    assert released == ["$cut-short"]

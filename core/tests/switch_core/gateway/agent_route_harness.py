@@ -1,0 +1,79 @@
+"""Rows the agent-route tests write straight into Postgres.
+
+An Agent cannot exist without a Client and an ApiKey, and the routes under test
+care about neither, so both are built here at their minimum shape.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from switch_core.db.models import Agent, ApiKey, Client, User
+from switch_core.db.stores.user_store import UserStore
+
+_USER_STORE = UserStore()
+
+# The settings an agent detail reads, with service connections switched on.
+SERVICES_ON = SimpleNamespace(service_connections_enabled=True)
+
+
+async def is_admin(session: AsyncSession, user: User) -> bool:
+    """The bit `get_tenant_is_admin` hands a route, resolved the same way.
+
+    A route takes it as an argument now, so a test calling the coroutine
+    directly has to supply one. Reading it through the store rather than
+    passing a literal keeps a `role="admin"` on the user row meaningful.
+    """
+    return await _USER_STORE.administers(session, user)
+
+
+async def add_user(session: AsyncSession, *, name: str, role: str = "user") -> User:
+    user = User(name=name, email=f"{name}@example.com", role=role)
+    session.add(user)
+    await session.flush()
+    return user
+
+
+async def add_agent(
+    session: AsyncSession,
+    *,
+    name: str,
+    owner_id: str | None,
+    icon_url: str | None = None,
+    display_name: str | None = None,
+) -> Agent:
+    client = Client(
+        type="agent",
+        transport_user_id=f"@{name}:test",
+        display_name=name,
+    )
+    session.add(client)
+    await session.flush()
+
+    api_key = ApiKey(
+        type="agent",
+        key_hash=f"hash-{name}",
+        encrypted_key=f"enc-{name}",
+        label=name,
+        user_id=owner_id,
+    )
+    session.add(api_key)
+    await session.flush()
+
+    agent = Agent(
+        name=name,
+        description=f"{name} desc",
+        icon_url=icon_url,
+        display_name=display_name,
+        agent_type="session_passive",
+        connector_type="external",
+        integration_profile={"connection_model": "session_passive"},
+        client_id=client.id,
+        api_key_id=api_key.id,
+        owner_id=owner_id,
+    )
+    session.add(agent)
+    await session.flush()
+    return agent

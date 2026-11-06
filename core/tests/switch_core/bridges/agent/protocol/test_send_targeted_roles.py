@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from switch_core.bridges.agent.protocol.agent_connections import AgentConnectionRegistry
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.bridges.agent.protocol.types import (
+    AgentStatus,
+    RoomWideMentionStatus,
+    SentMessage,
+)
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+def _session_factory() -> _FakeSession:
+    return _FakeSession()
+
+
+class _FakeRoomRoleStore:
+    def __init__(self, roles: list[Any], holders: dict[str, list[str]]) -> None:
+        self._roles = roles
+        self._holders = holders
+
+    async def list_roles(self, _session: Any, _room_id: str) -> list[Any]:
+        return list(self._roles)
+
+    async def live_holders_for_room(
+        self, _session: Any, _room_id: str, _live_conns: Any = ()
+    ) -> dict[str, list[str]]:
+        return {k: list(v) for k, v in self._holders.items()}
+
+
+class _FakeAgentStore:
+    def __init__(self, agents: dict[str, Any]) -> None:
+        self._agents = agents
+
+    async def get(self, _session: Any, agent_id: str) -> Any:
+        return self._agents.get(agent_id)
+
+
+class _FakeRoomStore:
+    def __init__(self, group_id: str | None, bridge_id: str | None) -> None:
+        self._group_id = group_id
+        self._bridge_id = bridge_id
+
+    async def get(self, _session: Any, _room_id: str) -> Any:
+        return SimpleNamespace(group_id=self._group_id, bridge_id=self._bridge_id)
+
+    async def list_aliases(self, _session: Any, _room_id: str) -> dict[str, str]:
+        return {}
+
+
+def _participant(
+    name: str, ptype: str, status: AgentStatus | None, *, agent_id: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=agent_id if agent_id is not None else f"a-{name}",
+        name=name,
+        type=ptype,
+        status=status,
+    )
+
+
+def _agent(name: str, addressing_policy: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name, addressing_policy=addressing_policy, owner_id="owner-1"
+    )
+
+
+def _build_service(
+    *,
+    participants: list[Any],
+    roles: list[Any],
+    holders: dict[str, list[str]],
+    agents: dict[str, Any],
+    group_id: str | None = None,
+) -> tuple[AgentCore, list[str]]:
+    sent_bodies: list[str] = []
+
+    svc = object.__new__(AgentCore)
+    # Presence unions the heartbeat rows with the live connections
+    # (CHOO-1857); an empty registry means "rows only".
+    svc.connections = AgentConnectionRegistry()
+    svc.session_factory = _session_factory  # type: ignore[assignment]
+    svc.room_role_store = _FakeRoomRoleStore(roles, holders)  # type: ignore[assignment]
+    svc.agent_store = _FakeAgentStore(agents)  # type: ignore[assignment]
+    svc.room_store = _FakeRoomStore(group_id, None)  # type: ignore[assignment]
+
+    async def _list_participants(_room_id: str) -> list[Any]:
+        return list(participants)
+
+    async def _send_message(
+        _agent_id: str,
+        _room_id: str,
+        body: str,
+        thread_id: str | None = None,
+        *,
+        extra_content: dict[str, object] | None = None,
+    ) -> SentMessage:
+        sent_bodies.append(body)
+        return SentMessage(event_id="evt-1", trust=None)
+
+    svc.list_participants = _list_participants  # type: ignore[assignment]
+    svc.send_message = _send_message  # type: ignore[assignment]
+    return svc, sent_bodies
+
+
+class TestSendTargetedRoles:
+    async def test_role_fans_out_to_live_holders(self) -> None:
+        role = SimpleNamespace(id="r-mgr", name="manager")
+        svc, bodies = _build_service(
+            participants=[
+                _participant("alice", "agent", AgentStatus.LIVE),
+                _participant("bob", "agent", AgentStatus.NO_SESSION),
+            ],
+            roles=[role],
+            holders={"r-mgr": ["a-alice", "a-bob"]},
+            agents={"a-alice": _agent("alice"), "a-bob": _agent("bob")},
+        )
+
+        result = await svc.send_targeted_message(
+            "sender", "room-1", [], "standup please", target_roles=["manager"]
+        )
+
+        # The body carries the @role token (routing fans out to holders).
+        assert bodies == ["@manager standup please"]
+        # Statuses report each live holder's reachability.
+        assert result.target_statuses == {
+            "alice": AgentStatus.LIVE,
+            "bob": AgentStatus.NO_SESSION,
+        }
+
+    async def test_names_and_roles_combine(self) -> None:
+        role = SimpleNamespace(id="r-mgr", name="manager")
+        svc, bodies = _build_service(
+            participants=[
+                _participant("carol", "agent", AgentStatus.LIVE),
+                _participant("alice", "agent", AgentStatus.LIVE),
+            ],
+            roles=[role],
+            holders={"r-mgr": ["a-alice"]},
+            agents={"a-alice": _agent("alice"), "a-carol": _agent("carol")},
+        )
+
+        result = await svc.send_targeted_message(
+            "sender", "room-1", ["carol"], "ping", target_roles=["manager"]
+        )
+
+        assert bodies == ["@carol @manager ping"]
+        assert result.target_statuses == {
+            "carol": AgentStatus.LIVE,
+            "alice": AgentStatus.LIVE,
+        }
+
+    async def test_unknown_role_raises(self) -> None:
+        svc, _ = _build_service(
+            participants=[],
+            roles=[SimpleNamespace(id="r-mgr", name="manager")],
+            holders={},
+            agents={},
+        )
+
+        with pytest.raises(ValueError, match="Roles not defined"):
+            await svc.send_targeted_message(
+                "sender", "room-1", [], "hi", target_roles=["ghost"]
+            )
+
+    async def test_no_targets_raises(self) -> None:
+        svc, _ = _build_service(participants=[], roles=[], holders={}, agents={})
+
+        with pytest.raises(ValueError, match="at least one"):
+            await svc.send_targeted_message("sender", "room-1", [], "hi")
+
+    async def test_role_with_no_live_holder_still_posts(self) -> None:
+        role = SimpleNamespace(id="r-mgr", name="manager")
+        svc, bodies = _build_service(
+            participants=[],
+            roles=[role],
+            holders={},  # nobody holds it
+            agents={},
+        )
+
+        result = await svc.send_targeted_message(
+            "sender", "room-1", [], "anyone?", target_roles=["manager"]
+        )
+
+        assert bodies == ["@manager anyone?"]
+        assert result.target_statuses == {}
+
+
+class TestSendTargetedAddressingGate:
+    """Targeting an agent whose policy does not admit you is reported, not
+    refused (CHOO-2137).
+
+    The message goes to the room and the target declines it there, the same as
+    an `@name` in an ordinary message — so the refusal is on the record in the
+    room rather than only in the sender's account of it. What the sender gets
+    back is `not_permitted` in place of a reachability status, because "live"
+    for an agent that is about to say no is the reading that sends someone
+    looking for a bug. Delegation still raises; a task is a row someone is
+    expected to work.
+    """
+
+    def _restricted(self) -> dict:
+        """Admits one specific other agent, so `sender` is not permitted."""
+        return {"rules": [{"agents": ["someone-else"], "users": []}]}
+
+    async def test_a_restricted_target_still_receives_the_message(self) -> None:
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={"a-alice": _agent("alice", self._restricted())},
+        )
+
+        result = await svc.send_targeted_message("sender", "room-1", ["alice"], "ping")
+
+        assert bodies == ["@alice ping"]
+        assert result.event_id
+
+    async def test_and_the_sender_is_told_it_will_be_declined(self) -> None:
+        # Without this the sender reads "live" and has no way to tell a refusal
+        # apart from an agent that simply had nothing to say.
+        svc, _bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={"a-alice": _agent("alice", self._restricted())},
+        )
+
+        result = await svc.send_targeted_message("sender", "room-1", ["alice"], "ping")
+
+        assert result.target_statuses == {"alice": AgentStatus.NOT_PERMITTED}
+
+    async def test_permitted_name_target_posts(self) -> None:
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={
+                "a-alice": _agent(
+                    "alice", {"rules": [{"agents": ["sender"], "users": []}]}
+                )
+            },
+        )
+
+        result = await svc.send_targeted_message("sender", "room-1", ["alice"], "ping")
+        assert bodies == ["@alice ping"]
+        assert result.target_statuses == {"alice": AgentStatus.LIVE}
+
+    async def test_owner_rule_does_not_admit_an_agent_sender(self) -> None:
+        # The sender agent shares alice's owner, but an owner rule admits the
+        # human, not the agents acting for them.
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={
+                "a-alice": _agent(
+                    "alice",
+                    {"rules": [{"agents": [], "users": [], "owner": True}]},
+                )
+            },
+        )
+
+        result = await svc.send_targeted_message("sender", "room-1", ["alice"], "ping")
+        assert result.target_statuses == {"alice": AgentStatus.NOT_PERMITTED}
+
+    async def test_a_restricted_role_holder_is_reported_too(self) -> None:
+        # Role targets are resolved to their live holders and checked the same
+        # way, so a role mention cannot be used to make the answer look better
+        # than naming the agent would.
+        role = SimpleNamespace(id="r-mgr", name="manager")
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[role],
+            holders={"r-mgr": ["a-alice"]},
+            agents={"a-alice": _agent("alice", self._restricted())},
+        )
+
+        result = await svc.send_targeted_message(
+            "sender", "room-1", [], "standup", target_roles=["manager"]
+        )
+
+        assert bodies == ["@manager standup"]
+        assert result.target_statuses == {"alice": AgentStatus.NOT_PERMITTED}
+
+    async def test_user_target_is_not_gated(self) -> None:
+        # The policy governs addressing an AGENT; a human target is the
+        # bridge's business.
+        svc, bodies = _build_service(
+            participants=[_participant("dana", "user", None)],
+            roles=[],
+            holders={},
+            agents={},
+        )
+
+        await svc.send_targeted_message("sender", "room-1", ["dana"], "ping")
+        assert bodies == ["@dana ping"]
+
+    async def test_group_scoped_policy_uses_the_rooms_group(self) -> None:
+        policy = {"rules": [{"room_groups": ["g1"], "agents": ["sender"], "users": []}]}
+        allowed, _bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={"a-alice": _agent("alice", policy)},
+            group_id="g1",
+        )
+        in_group = await allowed.send_targeted_message(
+            "sender", "room-1", ["alice"], "ping"
+        )
+        assert in_group.target_statuses == {"alice": AgentStatus.LIVE}
+
+        denied, _denied_bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={"a-alice": _agent("alice", policy)},
+            group_id="g2",
+        )
+        out_of_group = await denied.send_targeted_message(
+            "sender", "room-1", ["alice"], "ping"
+        )
+        assert out_of_group.target_statuses == {"alice": AgentStatus.NOT_PERMITTED}
+
+
+class TestRoomWideMentionStatus:
+    """What the room's bridge does with a room-wide mention, reported under
+    `everyone`. Whether it wakes an agent is pinned against a real database in
+    `test_room_wide_mention_wakes_no_agent.py`."""
+
+    async def _send(self, bridges: dict[str, Any], bridge_id: str | None) -> Any:
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={},
+        )
+        svc.room_store = _FakeRoomStore(None, bridge_id)  # type: ignore[assignment]
+        svc.collab_lifecycle = SimpleNamespace(get=bridges.get)  # type: ignore[assignment]
+        result = await svc.send_targeted_message("sender", "room-1", ["everyone"], "hi")
+        assert bodies == ["@everyone hi"]
+        return result.target_statuses
+
+    @staticmethod
+    def _bridge(notifies: bool, relays: bool) -> Any:
+        return SimpleNamespace(
+            adapter=SimpleNamespace(room_wide_mention_notifies=notifies),
+            relays_room=lambda _room_id: relays,
+        )
+
+    async def test_a_platform_that_pages_the_room(self) -> None:
+        statuses = await self._send({"b1": self._bridge(True, True)}, "b1")
+        assert statuses == {"everyone": RoomWideMentionStatus.SENT}
+
+    async def test_a_platform_with_no_channel_mention(self) -> None:
+        statuses = await self._send({"b1": self._bridge(False, True)}, "b1")
+        assert statuses == {"everyone": RoomWideMentionStatus.UNSUPPORTED}
+
+    async def test_a_bridge_that_is_not_running(self) -> None:
+        statuses = await self._send({}, "b1")
+        assert statuses == {"everyone": RoomWideMentionStatus.BRIDGE_UNAVAILABLE}
+
+    async def test_a_bridge_with_no_channel_for_the_room(self) -> None:
+        # Registered is not relaying: a bridge still starting, or one with no
+        # channel mapped for this room, drops the message.
+        statuses = await self._send({"b1": self._bridge(True, False)}, "b1")
+        assert statuses == {"everyone": RoomWideMentionStatus.BRIDGE_UNAVAILABLE}
+
+    async def test_a_room_with_no_bridge(self) -> None:
+        statuses = await self._send({}, None)
+        assert statuses == {"everyone": RoomWideMentionStatus.NO_BRIDGE}
+
+    async def test_a_platform_word_points_at_the_real_target(self) -> None:
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={},
+        )
+        with pytest.raises(ValueError, match="target 'everyone'"):
+            await svc.send_targeted_message("sender", "room-1", ["channel"], "hi")
+        assert bodies == []
+
+    async def test_the_sigil_is_forgiven(self) -> None:
+        # Agents write `@` out of habit; `@everyone` means the same thing.
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={},
+        )
+        svc.collab_lifecycle = SimpleNamespace(get=lambda _b: None)  # type: ignore[assignment]
+        result = await svc.send_targeted_message(
+            "sender", "room-1", ["@Everyone"], "hi"
+        )
+        assert bodies == ["@everyone hi"]
+        assert result.target_statuses == {"everyone": RoomWideMentionStatus.NO_BRIDGE}
+
+    async def test_a_thread_is_refused(self) -> None:
+        # Slack sends no channel-wide alert from a thread, and Discord's
+        # reaches only the thread's members, so it would report "sent" having
+        # paged next to nobody.
+        svc, bodies = _build_service(
+            participants=[_participant("alice", "agent", AgentStatus.LIVE)],
+            roles=[],
+            holders={},
+            agents={},
+        )
+        with pytest.raises(ValueError, match="cannot go in a thread"):
+            await svc.send_targeted_message(
+                "sender", "room-1", ["everyone"], "hi", thread_id="sw_root"
+            )
+        assert bodies == []

@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.db.models import Agent, ApiKey, Client, Room, Task, Tenant, User
+from switch_core.db.session_scope import tenant_session
+from switch_core.db.stores.agent_store import AgentStore
+
+
+async def _make_agent(session: AsyncSession, name: str, *, unique: str = "") -> Agent:
+    """Minimal User → ApiKey → Client → Agent chain.
+
+    `unique` disambiguates the user email / api-key hash / client matrix id —
+    each globally unique columns — when two agents share `name` across
+    tenants, since `name` itself is only unique per tenant.
+    """
+    slug = f"{name}-{unique}" if unique else name
+    user = User(name=name, email=f"{slug}@test", role="user", password_hash="x")
+    session.add(user)
+    await session.flush()
+    api_key = ApiKey(
+        user_id=user.id,
+        key_hash=f"hash-{slug}",
+        encrypted_key="enc",
+        label=name,
+        type="agent",
+    )
+    client = Client(
+        transport_user_id=f"@{slug}:test",
+        display_name=name,
+        type="agent",
+    )
+    session.add_all([api_key, client])
+    await session.flush()
+    agent = Agent(
+        name=name,
+        description=f"{name} desc",
+        agent_type="always_on",
+        connector_type="claude_code",
+        integration_profile={"connection_model": "always_on"},
+        client_id=client.id,
+        api_key_id=api_key.id,
+    )
+    session.add(agent)
+    await session.flush()
+    return agent
+
+
+async def _make_room(session: AsyncSession, name: str) -> Room:
+    room = Room(
+        transport_room_id=f"!{name}:test", name=name, description=f"{name} desc"
+    )
+    session.add(room)
+    await session.flush()
+    return room
+
+
+async def _make_task(
+    session: AsyncSession, room: Room, requester: Agent, performer: Agent
+) -> Task:
+    task = Task(
+        room_id=room.id,
+        requester_agent_id=requester.id,
+        performer_agent_id=performer.id,
+        summary="do a thing",
+        description="a longer description of the thing",
+        status="pending",
+    )
+    session.add(task)
+    await session.flush()
+    return task
+
+
+class TestDeleteAgentWithTasks:
+    """Regression for CHOO-1315: deleting an agent with task history must not
+    raise a ForeignKeyViolationError; dependent tasks cascade away."""
+
+    async def test_delete_performer_with_tasks_cascades(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        store = AgentStore()
+        async with session_factory() as session:
+            room = await _make_room(session, "room-perf")
+            requester = await _make_agent(session, "requester-perf")
+            performer = await _make_agent(session, "performer-perf")
+            task = await _make_task(session, room, requester, performer)
+            await session.commit()
+            task_id = task.id
+
+            await store.delete(session, performer.id)
+            await session.commit()
+
+        async with session_factory() as verify:
+            assert await verify.get(Agent, performer.id) is None
+            assert await verify.get(Task, task_id) is None
+            # The other party to the task is untouched.
+            assert await verify.get(Agent, requester.id) is not None
+
+    async def test_delete_requester_with_tasks_cascades(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        store = AgentStore()
+        async with session_factory() as session:
+            room = await _make_room(session, "room-req")
+            requester = await _make_agent(session, "requester-req")
+            performer = await _make_agent(session, "performer-req")
+            await _make_task(session, room, requester, performer)
+            await session.commit()
+            requester_id = requester.id
+            performer_id = performer.id
+
+            await store.delete(session, requester.id)
+            await session.commit()
+
+        async with session_factory() as verify:
+            assert await verify.get(Agent, requester_id) is None
+            remaining = await verify.execute(
+                select(Task).where(Task.requester_agent_id == requester_id)
+            )
+            assert remaining.scalars().first() is None
+            assert await verify.get(Agent, performer_id) is not None
+
+
+class TestGetByNameMultiTenant:
+    """`Agent.name` is unique per tenant (`uq_agents_tenant_name`), not
+    globally — two tenants may each have an agent of the same name. Before
+    scoping the read, an unfiltered `get_by_name`/`get_by_name_insensitive`
+    matched both rows and raised `MultipleResultsFound` out of every caller
+    that resolves an agent by name (mention routing, registration, the
+    gateway).
+
+    Each tenant gets its own session, opened inside its own binding with
+    `tenant_session`, for both the arrangement and the read back. A session's
+    transaction is stamped with whatever tenant was bound when it began —
+    `set_config` rides `after_begin`, issued once — so entering
+    `tenant_scope(other_tenant)` around statements on the session already open
+    for tenant zero would rebind the contextvar without moving what Postgres
+    was told, and the two would disagree from that statement on.
+    """
+
+    async def test_get_by_name_returns_the_bound_tenants_agent(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        store = AgentStore()
+        other_tenant = f"tenant-{uuid.uuid4().hex[:8]}"
+
+        async with session_factory() as session:
+            session.add(Tenant(id=other_tenant, slug=other_tenant, name=other_tenant))
+            await session.flush()
+            own_id = (await _make_agent(session, "shared-name")).id
+            await session.commit()
+
+        async with tenant_session(session_factory, other_tenant) as other_session:
+            other_id = (
+                await _make_agent(other_session, "shared-name", unique="other")
+            ).id
+            await other_session.commit()
+
+        async with session_factory() as verify:
+            result = await store.get_by_name(verify, "shared-name")
+            assert result is not None
+            assert result.id == own_id
+
+        async with tenant_session(session_factory, other_tenant) as verify:
+            result = await store.get_by_name(verify, "shared-name")
+            assert result is not None
+            assert result.id == other_id
+
+    async def test_get_by_name_insensitive_returns_the_bound_tenants_agent(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        store = AgentStore()
+        other_tenant = f"tenant-{uuid.uuid4().hex[:8]}"
+
+        async with session_factory() as session:
+            session.add(Tenant(id=other_tenant, slug=other_tenant, name=other_tenant))
+            await session.flush()
+            own_id = (await _make_agent(session, "SharedName")).id
+            await session.commit()
+
+        async with tenant_session(session_factory, other_tenant) as other_session:
+            other_id = (
+                await _make_agent(other_session, "sharedname", unique="other")
+            ).id
+            await other_session.commit()
+
+        async with session_factory() as verify:
+            result = await store.get_by_name_insensitive(verify, "sharedname")
+            assert result is not None
+            assert result.id == own_id
+
+        async with tenant_session(session_factory, other_tenant) as verify:
+            result = await store.get_by_name_insensitive(verify, "sharedname")
+            assert result is not None
+            assert result.id == other_id

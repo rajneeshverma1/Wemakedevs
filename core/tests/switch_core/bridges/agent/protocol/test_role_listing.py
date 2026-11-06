@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+from switch_core.bridges.agent.protocol.agent_connections import AgentConnectionRegistry
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+
+
+class _FakeSession:
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def commit(self) -> None:
+        return None
+
+
+def _session_factory() -> _FakeSession:
+    return _FakeSession()
+
+
+class _FakeRoomRoleStore:
+    def __init__(
+        self,
+        roles: list[Any],
+        leases: dict[str, list[Any]],
+        my_lease: Any | None,
+    ) -> None:
+        self._roles = roles
+        self._leases = leases
+        self._my_lease = my_lease
+
+    async def list_roles(self, _session: Any, _room_id: str) -> list[Any]:
+        return list(self._roles)
+
+    async def live_leases_for_room(
+        self, _session: Any, _room_id: str, _live_conns: Any = ()
+    ) -> dict[str, list[Any]]:
+        return {k: list(v) for k, v in self._leases.items()}
+
+    async def get_agent_live_lease(
+        self, _session: Any, _agent_id: str, _live_conns: Any = ()
+    ) -> Any | None:
+        return self._my_lease
+
+
+class _FakeAgentStore:
+    def __init__(self, agents: dict[str, Any]) -> None:
+        self._agents = agents
+
+    async def get(self, _session: Any, agent_id: str) -> Any:
+        return self._agents.get(agent_id)
+
+
+class _FakeAgentSessionStore:
+    """Where a transport session is, by its binding."""
+
+    def __init__(self, bindings: dict[str, tuple[str, str]]) -> None:
+        self._bindings = bindings
+
+    async def get_connected_room(
+        self, _session: Any, transport_session_id: str
+    ) -> tuple[str, str] | None:
+        return self._bindings.get(transport_session_id)
+
+
+class _FakeRoomStore:
+    def __init__(self, rooms: dict[str, Any]) -> None:
+        self._rooms = rooms
+
+    async def get(self, _session: Any, room_id: str) -> Any:
+        return self._rooms.get(room_id)
+
+
+def _role(
+    role_id: str, name: str, exclusive: bool, instructions: str
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=role_id, name=name, exclusive=exclusive, instructions=instructions
+    )
+
+
+def _lease(
+    role_id: str,
+    agent_id: str,
+    transport_session_id: str | None,
+    session_id: str | None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        role_id=role_id,
+        agent_id=agent_id,
+        transport_session_id=transport_session_id,
+        session_id=session_id,
+    )
+
+
+def _build_service(
+    *,
+    roles: list[Any],
+    leases: dict[str, list[Any]],
+    agents: dict[str, Any],
+    bindings: dict[str, tuple[str, str]],
+    sdk_rooms: dict[str, str],
+    rooms: dict[str, Any],
+    my_lease: Any | None = None,
+) -> AgentCore:
+    svc = object.__new__(AgentCore)
+    # Presence unions the heartbeat rows with the live connections
+    # (CHOO-1857); an empty registry means "rows only".
+    svc.connections = AgentConnectionRegistry()
+    # Where each holding session connected, as `connect_to_room` placed it.
+    for session_id, room_id in sdk_rooms.items():
+        holder = next(
+            lease.agent_id
+            for held in leases.values()
+            for lease in held
+            if lease.session_id == session_id
+        )
+        svc.connections.place_session(holder, session_id, room_id, f"conn-{session_id}")
+    svc.session_factory = _session_factory  # type: ignore[assignment]
+    svc.room_role_store = _FakeRoomRoleStore(roles, leases, my_lease)  # type: ignore[assignment]
+    svc.agent_store = _FakeAgentStore(agents)  # type: ignore[assignment]
+    svc.agent_session_store = _FakeAgentSessionStore(bindings)  # type: ignore[assignment]
+    svc.room_store = _FakeRoomStore(rooms)  # type: ignore[assignment]
+    return svc
+
+
+class TestListRoomRoles:
+    async def test_a_session_holder_is_located_by_its_own_room(self) -> None:
+        """Where the connection cannot answer and the session can.
+
+        Both holders took their seat over the same controller connection, so
+        that connection carries both rooms and naming one from it would put
+        half the holders in the wrong place. The seat records which session
+        took it, and a session is in one room.
+        """
+        role = _role("role-w", "worker", False, "do the work")
+        leases = {
+            "role-w": [
+                _lease("role-w", "a-here", "conn-shared", "sdk-here"),
+                _lease("role-w", "a-elsewhere", "conn-shared", "sdk-elsewhere"),
+            ]
+        }
+        svc = _build_service(
+            roles=[role],
+            leases=leases,
+            agents={
+                "a-here": SimpleNamespace(name="alice"),
+                "a-elsewhere": SimpleNamespace(name="bob"),
+            },
+            bindings={"conn-shared": ("a-here", "room-1")},
+            sdk_rooms={"sdk-here": "room-1", "sdk-elsewhere": "room-2"},
+            rooms={
+                "room-1": SimpleNamespace(name="This Room"),
+                "room-2": SimpleNamespace(name="Other Room"),
+            },
+        )
+
+        result = await svc.list_room_roles("viewer", "room-1")
+
+        by_name = {h["name"]: h for h in result[0]["held_by"]}
+        assert by_name["alice"]["present_here"] is True
+        assert by_name["bob"] == {
+            "name": "bob",
+            "present_here": False,
+            "session_room": "Other Room",
+        }
+
+    async def test_holder_locations_here_elsewhere_and_unbound(self) -> None:
+        # Shared role with three holders: one connected here, one attending
+        # another room, one whose session can't be located.
+        role = _role("role-w", "worker", False, "do the work")
+        leases = {
+            "role-w": [
+                _lease("role-w", "a-here", "tx-here", None),
+                _lease("role-w", "a-elsewhere", "tx-elsewhere", None),
+                _lease("role-w", "a-unbound", None, None),
+            ]
+        }
+        svc = _build_service(
+            roles=[role],
+            leases=leases,
+            agents={
+                "a-here": SimpleNamespace(name="alice"),
+                "a-elsewhere": SimpleNamespace(name="bob"),
+                "a-unbound": SimpleNamespace(name="carol"),
+            },
+            bindings={
+                "tx-here": ("a-here", "room-1"),
+                "tx-elsewhere": ("a-elsewhere", "room-2"),
+            },
+            sdk_rooms={},
+            rooms={
+                "room-1": SimpleNamespace(name="This Room"),
+                "room-2": SimpleNamespace(name="Other Room"),
+            },
+        )
+
+        result = await svc.list_room_roles("viewer", "room-1")
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["name"] == "worker"
+        assert entry["exclusive"] is False
+        by_name = {h["name"]: h for h in entry["held_by"]}
+        assert by_name["alice"] == {
+            "name": "alice",
+            "present_here": True,
+            "session_room": None,
+        }
+        assert by_name["bob"] == {
+            "name": "bob",
+            "present_here": False,
+            "session_room": "Other Room",
+        }
+        assert by_name["carol"] == {
+            "name": "carol",
+            "present_here": False,
+            "session_room": None,
+        }
+
+    async def test_free_role_has_empty_held_by_and_is_assumable(self) -> None:
+        role = _role("role-m", "manager", True, "coordinate")
+        svc = _build_service(
+            roles=[role],
+            leases={},
+            agents={},
+            bindings={},
+            sdk_rooms={},
+            rooms={"room-1": SimpleNamespace(name="This Room")},
+        )
+
+        result = await svc.list_room_roles("viewer", "room-1")
+
+        assert result[0]["held_by"] == []
+        assert result[0]["assumable_by_me"] is True
+
+    async def test_exclusive_held_by_other_blocks_assume(self) -> None:
+        role = _role("role-m", "manager", True, "coordinate")
+        leases = {"role-m": [_lease("role-m", "holder", "tx-h", None)]}
+        svc = _build_service(
+            roles=[role],
+            leases=leases,
+            agents={"holder": SimpleNamespace(name="dan")},
+            bindings={"tx-h": ("holder", "room-1")},
+            sdk_rooms={},
+            rooms={"room-1": SimpleNamespace(name="This Room")},
+        )
+
+        result = await svc.list_room_roles("viewer", "room-1")
+
+        assert [h["name"] for h in result[0]["held_by"]] == ["dan"]
+        assert result[0]["held_by"][0]["present_here"] is True
+        assert result[0]["assumable_by_me"] is False

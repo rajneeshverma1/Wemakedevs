@@ -1,0 +1,300 @@
+"""Every gateway route that opens the request session is authenticated.
+
+`get_session` is the tenant-scoped session (`gateway/dependencies.py`): the
+tenant is stamped on its transaction by the `after_begin` hook, and what binds
+that tenant is `get_current_user`. A route that takes the session without
+taking the user therefore runs its whole transaction unscoped — today that
+merely reads and writes unscoped, and once the row-level-security policies land
+it fails outright. Either way it is not a thing to discover one route at a
+time.
+
+FastAPI also resolves an endpoint's dependencies in *declaration order*, so
+"authenticated" is necessary but not sufficient: a sibling dependency declared
+before `get_current_user` that queried the session during its own resolution
+would still open the transaction untenanted. Nothing does — every other
+dependency is a plain accessor — but that is not mechanically checkable the way
+this is, so it is written down in `get_session`'s docstring and this test holds
+the checkable half.
+
+Generalised from `test_collaborations_authz.py`'s per-router check, and derived
+from the package rather than a hand-written list, so a new gateway router
+module is covered the day it appears.
+"""
+
+from __future__ import annotations
+
+import importlib
+import pkgutil
+from dataclasses import dataclass
+
+from fastapi import APIRouter
+
+import switch_core.gateway as gateway_package
+from switch_core.gateway.auth import (
+    get_authenticated_caller,
+    get_authenticated_user_id,
+    get_current_user,
+    get_current_user_in_transaction,
+    require_admin,
+)
+from switch_core.gateway.dependencies import get_session, get_system_session
+from switch_core.gateway.hosted_controller import controller_session
+
+# The only routes that may open a session with no tenant bound. `get_session`
+# is unavailable to them because there is no `get_current_user` to bind one:
+# for login and the OIDC callback there is no caller yet at all; for the rest
+# the caller is authenticated but has, by construction, no selected tenant to
+# bind — switching is choosing one, creating a workspace makes one, and the
+# session state is how a caller without one learns so. See
+# `get_system_session`'s docstring. They take `get_system_session` instead,
+# which says so in the signature.
+_ROUTES_WITH_NO_TENANT_BOUND = {
+    ("POST", "/auth/login"),
+    # Self sign-up has no caller either; it writes into tenant zero by name.
+    ("POST", "/auth/signup"),
+    ("GET", "/auth/oidc/callback"),
+    # The browser sign-in's last step: a one-time code and its verifier,
+    # traded for the session cookie, before there is a session to bind from.
+    ("POST", "/auth/oidc/exchange"),
+    ("GET", "/auth/session"),
+    ("POST", "/tenants"),
+    ("POST", "/tenants/{tenant_id}/switch"),
+    # Locks the caller's `users` row, which has no tenant, while it creates a
+    # workspace that has none yet either.
+    ("POST", "/tenants"),
+    ("POST", "/organizations"),
+    # Deletes the caller's `users` row and sign-in identities, which belong to
+    # no workspace; each workspace is left in a `tenant_session` of its own.
+    ("DELETE", "/auth/me"),
+    # "Sign out of all devices" moves the caller's `users` row on, which has no
+    # tenant, and must work for a caller with no workspace selected.
+    ("POST", "/auth/sessions/revoke"),
+}
+
+# Every route that does not resolve a tenant, for any reason. `get_current_user`
+# is the only dependency that performs the membership check in
+# `_resolve_tenant_id`, so a route without it authorizes against no workspace —
+# whether it skipped the check deliberately (`get_authenticated_user_id`,
+# `get_authenticated_caller`) or simply has no caller yet (login, the OIDC
+# handshake).
+#
+# The predicate is the absence of `get_current_user` rather than the presence of
+# any particular alternative, because the alternatives keep arriving: keying on
+# `get_system_session` missed the routes that take `get_session_factory` and open
+# their own, and keying on `get_authenticated_user_id` missed
+# `get_authenticated_caller`. This way the next door is a failing test rather
+# than a route nobody counted. `_ROUTES_WITH_NO_TENANT_BOUND` is a strict subset.
+_ROUTES_THAT_NEVER_BIND_A_TENANT = {
+    # Browser handoff uses a short-lived flow, browser cookie and PKCE; saving
+    # credentials requires the initiating user to hand the code back through
+    # the authenticated API.
+    ("GET", "/provider-connections/github/authorize"),
+    ("GET", "/provider-connections/github/callback"),
+    # The same handoff for every other service's sign-in (`connections/flows.py`).
+    ("GET", "/service-connections/{service}/flows/authorize"),
+    ("GET", "/service-connections/{service}/flows/callback"),
+    # No caller yet: the sign-in surface and what it hands back.
+    ("GET", "/auth/config"),
+    ("GET", "/auth/oidc/login"),
+    ("GET", "/auth/oidc/callback"),
+    ("POST", "/auth/oidc/exchange"),
+    ("POST", "/auth/login"),
+    ("POST", "/auth/signup"),
+    ("POST", "/auth/logout"),
+    # Signing out of all devices acts on the account, not a workspace, and a
+    # caller with several and none selected must be able to reach it.
+    ("POST", "/auth/sessions/revoke"),
+    # Deleting your account acts on every workspace you are in, each in a
+    # `tenant_session` of its own (`accounts/deletion.py`).
+    ("DELETE", "/auth/me"),
+    # What a signed-in caller's session resolves to — including that it
+    # resolves to no workspace, which is the answer a caller with none needs.
+    ("GET", "/auth/session"),
+    # A deployment-wide constant — the agent types this build knows about.
+    # Nothing tenant-specific to scope it to.
+    ("GET", "/known-types"),
+    # A caller with several memberships and no selection cannot reach
+    # `get_current_user` by construction, and these are the routes such a
+    # caller needs: list the workspaces, make one, pick one.
+    ("GET", "/tenants"),
+    ("POST", "/tenants"),
+    ("POST", "/tenants/{tenant_id}/switch"),
+    # The same for organizations: list the caller's, make one.
+    ("GET", "/organizations"),
+    ("POST", "/organizations"),
+    # Accepting an invitation binds the tenant the *token* names, which is
+    # neither the one on the caller's session nor one they belong to yet. It
+    # opens its own `tenant_session` around that id — see `accept_invitation`.
+    ("POST", "/invitations/accept"),
+    # Invitations addressed to the caller are in workspaces they are not in, so
+    # no session of theirs is bound to one. Listing opens a `tenant_session`
+    # per tenant `tenants_with_invitations_for` names; accepting opens one
+    # around the tenant the request names, and finds nothing if the
+    # invitation is not there — see `list_my_invitations` and
+    # `accept_my_invitation`.
+    ("GET", "/invitations/mine"),
+    ("POST", "/invitations/mine/accept"),
+    # Workspaces open to the caller's e-mail domain are ones they are not in
+    # yet, for the same reason. Listing opens a `tenant_session` per tenant
+    # `tenants_open_to` names; joining opens one around the tenant in the path
+    # and finds nothing unless it is open to the caller's domain — see
+    # `list_joinable_tenants` and `join_tenant_by_domain`.
+    ("GET", "/joinable-tenants"),
+    ("POST", "/joinable-tenants/{tenant_id}/join"),
+    # Feature flags belong to the deployment and come from its config, so
+    # there is no workspace to scope them to and no session is opened.
+    ("GET", "/feature-flags"),
+    # The platform operator's list of every workspace, to enter one from.
+    # It opens a `tenant_session` per tenant `all_tenant_ids` names, and
+    # answers 403 to anyone but the operator — see `list_every_workspace`.
+    ("GET", "/operator/workspaces"),
+}
+
+
+@dataclass(frozen=True)
+class _Route:
+    module: str
+    method: str
+    path: str
+    calls: tuple[object, ...]
+
+    def __str__(self) -> str:
+        return f"{self.module}: {self.method} {self.path}"
+
+    @property
+    def binds_a_tenant(self) -> bool:
+        return (
+            get_current_user in self.calls
+            or get_current_user_in_transaction in self.calls
+        )
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.method, self.path)
+
+
+def _dependency_calls(dependant: object) -> list[object]:
+    """All dependency callables reachable from a route, recursively."""
+    calls = [dependant.call]  # type: ignore[attr-defined]
+    for sub in dependant.dependencies:  # type: ignore[attr-defined]
+        calls.extend(_dependency_calls(sub))
+    return calls
+
+
+def _gateway_routes() -> list[_Route]:
+    """Every route on every `router` in the `switch_core.gateway` package."""
+    routes: list[_Route] = []
+    for info in pkgutil.iter_modules(gateway_package.__path__):
+        module = importlib.import_module(f"{gateway_package.__name__}.{info.name}")
+        router = getattr(module, "router", None)
+        if not isinstance(router, APIRouter):
+            continue
+        for route in router.routes:
+            dependant = getattr(route, "dependant", None)
+            if dependant is None:
+                continue
+            calls = tuple(_dependency_calls(dependant))
+            for method in sorted(getattr(route, "methods", ()) or ()):
+                routes.append(_Route(info.name, method, route.path, calls))
+    return routes
+
+
+ROUTES = _gateway_routes()
+
+
+def test_the_discovery_finds_the_gateway_routers() -> None:
+    """Guard the guard: a broken import or a renamed attribute would make
+    every assertion below pass over an empty set."""
+    assert {"auth_routes", "rooms", "agents", "collaborations"} <= {
+        route.module for route in ROUTES
+    }
+    assert len([r for r in ROUTES if get_session in r.calls]) > 50
+
+
+def test_every_route_taking_the_session_also_authenticates() -> None:
+    unauthenticated = sorted(
+        str(route)
+        for route in ROUTES
+        if get_session in route.calls
+        and route.key not in _ROUTES_WITH_NO_TENANT_BOUND
+        and not route.binds_a_tenant
+        and require_admin not in route.calls
+    )
+    assert not unauthenticated, (
+        "these routes open the tenant-scoped session without an authenticated "
+        f"caller to take a tenant from: {unauthenticated}"
+    )
+
+
+def test_the_routes_with_no_tenant_bound_are_exactly_these() -> None:
+    """The exemption above is not a list to grow casually: `get_system_session`
+    exists so that adding another is a visible act, not a signature nobody
+    reads."""
+    assert {
+        route.key for route in ROUTES if get_system_session in route.calls
+    } == _ROUTES_WITH_NO_TENANT_BOUND
+
+
+def test_the_routes_that_never_bind_a_tenant_are_exactly_these() -> None:
+    """Pinned by the same reasoning `test_tenant_exemption_allowlist` gives for
+    the `SECURITY DEFINER` lookups — what matters is that skipping the tenant
+    check is *reachable*, not that today's callers happen to be the right ones.
+    A route that lands here has no workspace to authorize against and has to
+    say, in its own docstring, what it does instead."""
+    assert {
+        route.key
+        for route in ROUTES
+        if not route.binds_a_tenant and controller_session not in route.calls
+    } == _ROUTES_THAT_NEVER_BIND_A_TENANT
+
+
+def test_controller_credential_is_confined_to_the_controller_routes() -> None:
+    assert {route.key for route in ROUTES if controller_session in route.calls} == {
+        ("GET", "/hosted-controller/machines"),
+        ("POST", "/hosted-controller/machines/{machine_id}/prepare"),
+        ("POST", "/hosted-controller/machines/{machine_id}/observation"),
+    }
+
+
+def test_the_routes_with_no_tenant_bound_do_not_bind_a_tenant() -> None:
+    """The two exemptions agree: anything allowed to open an unscoped session
+    is, necessarily, a route that resolves no tenant."""
+    assert _ROUTES_WITH_NO_TENANT_BOUND <= _ROUTES_THAT_NEVER_BIND_A_TENANT
+
+
+def test_skipping_tenant_resolution_is_only_reached_by_a_known_dependency() -> None:
+    """`get_authenticated_user_id` and `get_authenticated_caller` verify the
+    cookie and stop there — no membership read, no scoped session, nothing a
+    policy would refuse. They are the only authenticated way into the set
+    above; a route that invents a third is caught here rather than inheriting
+    the exemption quietly."""
+    assert not [
+        str(route)
+        for route in ROUTES
+        if (
+            get_authenticated_user_id in route.calls
+            or get_authenticated_caller in route.calls
+        )
+        and route.key not in _ROUTES_THAT_NEVER_BIND_A_TENANT
+    ]
+
+
+def test_no_route_both_resolves_a_tenant_and_skips_resolving_one() -> None:
+    """Taking both would mean the membership check runs and its answer is
+    ignored — the route would authorize against whichever dependency it
+    happened to read."""
+    assert not [
+        str(route)
+        for route in ROUTES
+        if get_authenticated_user_id in route.calls and route.binds_a_tenant
+    ]
+
+
+def test_the_exempt_routes_do_not_also_take_the_tenant_scoped_session() -> None:
+    """A route holding both would be authenticated-looking and unscoped at
+    once, which is the worst of the two."""
+    assert not [
+        str(route)
+        for route in ROUTES
+        if get_session in route.calls and route.key in _ROUTES_WITH_NO_TENANT_BOUND
+    ]

@@ -1,0 +1,1311 @@
+"""The controller's one stream: its agents' events, merged, and the nudges.
+
+Against Postgres, through the real routes and Core's real connection registry
+and event buffer. The stream itself is read from the route's own response,
+since the in-process HTTP transport would wait for a stream that never ends.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from typing import Any
+
+import pytest
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.agent.commands import room_control_frame
+from switch_core.bridges.agent.protocol import controller_stream
+from switch_core.bridges.agent.protocol.agent_detail import assemble_agent_detail
+from switch_core.bridges.agent.protocol.liveness import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_TTL_SECONDS,
+)
+from switch_core.bridges.agent.protocol.presence import (
+    agents_present_in,
+    rooms_occupied,
+)
+from switch_core.bridges.agent.protocol.types import AgentEvent, MessagePayload
+from switch_core.db.models import TENANT_ZERO_ID
+from switch_core.db.stores.agent_session_store import AgentSessionStore
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.room_role_store import RoomRoleStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.management import controller_routes, socket_calls
+from switch_core.management.notifier import (
+    ASSIGNMENT_CHANGED,
+    CREDENTIAL_REVOKED,
+    OPERATION_PENDING,
+    ControllerNotifier,
+)
+from switch_core.observability.catalogue import DB_QUERY_DURATION
+from switch_core.observability.metrics import MetricsRegistry, install, uninstall
+from switch_core.observability.query import instrument_queries
+from tests.db_buffer import age_events, say
+from tests.session_counting import CountingSessionFactory
+from tests.switch_core.management.harness import (
+    Harness,
+    add_member,
+    add_room,
+    attach,
+    beat,
+    build_harness,
+    cookies_for,
+    enroll_console,
+    open_connection,
+    open_stream,
+    parse_frame,
+    place_agent,
+    provider,
+    report_status,
+    take,
+)
+
+
+@pytest.fixture
+def harness(session_factory: async_sessionmaker[AsyncSession]) -> Harness:
+    return build_harness(session_factory)
+
+
+def _message(room_id: str, body: str, *, message_id: str) -> AgentEvent:
+    return AgentEvent(
+        type="message",
+        room_id=room_id,
+        payload=MessagePayload(
+            addressed=True,
+            sender="@ada:test",
+            sender_name="Ada",
+            message_id=message_id,
+            body=body,
+            timestamp=0,
+        ),
+    )
+
+
+async def _ask(harness: Harness, agent_id: str, room_id: str, body: str) -> int:
+    """A message addressed to the agent, as its consumer keeps it: the row in
+    the room's log, and the agent's own event for that row. The event's number
+    in the agent's own events, which is what the controller is sent."""
+    row = await say(
+        harness.session_factory, room_id, body, sender="@ada:test", sender_name="Ada"
+    )
+    return await harness.protocol.event_buffer.enqueue(
+        TENANT_ZERO_ID,
+        agent_id,
+        room_id,
+        _message(room_id, body, message_id=row.transport_event_id),
+        room_seq=row.seq,
+        message_key=row.transport_event_id,
+    )
+
+
+class TestTheNotifier:
+    def test_signals_coalesce_and_revocation_comes_last(self) -> None:
+        notifier = ControllerNotifier()
+        subscription = notifier.subscribe("c1")
+        notifier.credential_revoked("c1")
+        notifier.assignment_changed("c1", 3)
+        notifier.assignment_changed("c1", 5)
+        notifier.assignment_changed("c1", 4)
+        notifier.operation_pending(
+            "c1", operation_id="o1", kind="agent.restart", agent_id="a"
+        )
+        notifier.assignment_changed("c2", 9)
+
+        assert subscription.wake.is_set()
+        assert subscription.drain() == [
+            (ASSIGNMENT_CHANGED, {"revision": 5}),
+            (
+                OPERATION_PENDING,
+                {"operation_id": "o1", "kind": "agent.restart", "agent_id": "a"},
+            ),
+            (CREDENTIAL_REVOKED, {}),
+        ]
+        assert not subscription.wake.is_set()
+        assert subscription.drain() == []
+
+    def test_every_open_stream_hears_and_a_closed_one_is_forgotten(self) -> None:
+        notifier = ControllerNotifier()
+        first = notifier.subscribe("c1")
+        second = notifier.subscribe("c1")
+        notifier.assignment_changed("c1", 1)
+        assert (
+            first.drain() == second.drain() == [(ASSIGNMENT_CHANGED, {"revision": 1})]
+        )
+        first.close()
+        second.close()
+        assert notifier.subscriber_count("c1") == 0
+
+
+class TestOpening:
+    async def test_open_names_the_bound_agents_and_the_stream_attaches_them(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+        assert opened["agents"] == [agent_id]
+        assert opened["heartbeat_interval_s"] == HEARTBEAT_INTERVAL_SECONDS
+
+        stream = await open_stream(harness, controller, opened)
+        (state, attached) = await take(stream, 2)
+        await stream.aclose()
+
+        assert state == (
+            "connection_state",
+            {
+                "controller_id": controller.controller_id,
+                "assignment_revision": 1,
+                "report_within_s": 60,
+                "connection_id": opened["connection_id"],
+                "generation": opened["generation"],
+                "heartbeat_interval_s": HEARTBEAT_INTERVAL_SECONDS,
+                "calls": {"max_in_flight": socket_calls.MAX_CALLS_IN_FLIGHT},
+            },
+        )
+        assert attached == (
+            "agent.attached",
+            {"agent_id": agent_id, "from_seq": 0, "rooms": [room_id]},
+        )
+
+    async def test_events_resume_from_the_cursor_tagged_with_their_agent(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            first = await place_agent(client, controller, name="first")
+            second = await place_agent(client, controller, name="second")
+            room_id = await add_room(harness.session_factory, first, second)
+            for body in ("one", "two", "three"):
+                await _ask(harness, first, room_id, body)
+            await _ask(harness, second, room_id, "hi")
+            opened = await open_connection(client, controller, {first: 1})
+
+        stream = await open_stream(harness, controller, opened)
+        frames = await take(stream, 5)
+        await stream.aclose()
+
+        attached = {
+            data["agent_id"]: data for name, data in frames if name == "agent.attached"
+        }
+        # The first resumes where it asked; the second asked nothing and
+        # starts at its head.
+        assert attached[first]["from_seq"] == 1
+        assert attached[second]["from_seq"] == 1
+        events = [
+            (d["agent_id"], d["seq"], d["event"])
+            for n, d in frames
+            if n == "agent.event"
+        ]
+        assert [(agent, seq) for agent, seq, _ in events] == [(first, 2), (first, 3)]
+        bodies = [event["payload"]["body"] for _, _, event in events]
+        assert bodies == ["two", "three"]
+        assert all(event["sequence"] == seq for _, seq, event in events)
+
+    async def test_an_addressed_event_carries_the_missed_count(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+        await say(harness.session_factory, room_id, "chatter", sender="@ada:test")
+        await say(harness.session_factory, room_id, "more", sender="@ada:test")
+        await _ask(harness, agent_id, room_id, "@you")
+        [(name, data)] = await take(stream, 1)
+        await stream.aclose()
+
+        # The chatter itself is not sent: the controller is sent the agent's
+        # own events, and told on the next of them how much went past.
+        assert name == "agent.event"
+        assert data["event"]["payload"]["body"] == "@you"
+        assert data["event"]["missed"] == {"count": 2, "reason": None}
+
+    async def test_an_agents_pass_reads_in_one_session(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The agent's own events, what was dropped after its cursor and the
+        unread counts cost one pool checkout and one transaction, not one of
+        each per read, after one read of the heads of the controller's agents."""
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+        await _ask(harness, agent_id, room_id, "@you")
+        buffer = harness.protocol.event_buffer
+        counting = CountingSessionFactory(buffer._session_factory)
+        monkeypatch.setattr(buffer, "_session_factory", counting)
+        [(name, data)] = await take(stream, 1)
+        await stream.aclose()
+
+        assert name == "agent.event"
+        assert data["event"]["payload"]["body"] == "@you"
+        assert counting.opened == 2
+
+    async def test_a_cursor_from_before_a_restart_is_a_gap(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller, {agent_id: 900})
+
+        stream = await open_stream(harness, controller, opened)
+        frames = await take(stream, 3)
+        await stream.aclose()
+
+        assert frames[1] == (
+            "agent.attached",
+            {"agent_id": agent_id, "from_seq": 0, "rooms": [room_id]},
+        )
+        name, gap = frames[2]
+        assert name == "agent.gap"
+        assert gap["agent_id"] == agent_id
+        assert gap["all_rooms"] is True
+        assert gap["rooms"] == [room_id]
+
+    async def test_an_expired_cursor_is_a_gap_naming_the_rooms(
+        self, harness: Harness
+    ) -> None:
+        buffer = harness.protocol.event_buffer
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            for body in ("a", "b"):
+                await _ask(harness, agent_id, room_id, body)
+            await age_events(harness.session_factory, agent_id, seconds=2 * 3600)
+            await buffer.expire(TENANT_ZERO_ID)
+            for body in ("c", "d"):
+                await _ask(harness, agent_id, room_id, body)
+            opened = await open_connection(client, controller, {agent_id: 0})
+
+        stream = await open_stream(harness, controller, opened)
+        frames = await take(stream, 5)
+        await stream.aclose()
+
+        name, gap = frames[2]
+        assert name == "agent.gap"
+        assert (gap["rooms"], gap["all_rooms"], gap["resumed_at"]) == (
+            [room_id],
+            False,
+            2,
+        )
+        assert [d["seq"] for n, d in frames[3:]] == [3, 4]
+
+
+class TestLiveChanges:
+    async def test_placing_and_moving_an_agent_attach_and_detach_it_live(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            first = await enroll_console(harness, client, owner, "one")
+            second = await enroll_console(harness, client, owner, "two")
+            await report_status(client, second, 1, providers=[provider("claude")])
+            opened = await open_connection(client, first)
+            stream = await open_stream(harness, first, opened)
+            assert [name for name, _ in await take(stream, 1)] == ["connection_state"]
+
+            agent_id = await place_agent(client, first, name="reviewer")
+            arrived = await take(stream, 2)
+            moved = await client.patch(
+                f"/gateway/management/agents/{agent_id}",
+                json={"controller_id": second.controller_id},
+                cookies=cookies_for(owner),
+            )
+            assert moved.status_code == 200, moved.text
+            departed = await take(stream, 2)
+        await stream.aclose()
+
+        assert sorted(name for name, _ in arrived) == [
+            "agent.attached",
+            "assignment.changed",
+        ]
+        assert (
+            "agent.detached",
+            {"agent_id": agent_id, "reason": "unassigned"},
+        ) in departed
+        assert "assignment.changed" in [name for name, _ in departed]
+
+    async def test_deleting_the_agent_detaches_it_as_deleted(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            opened = await open_connection(client, controller)
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+
+        await harness.management.agent_removed(TENANT_ZERO_ID, agent_id)
+        frames = await take(stream, 2)
+        await stream.aclose()
+
+        assert ("agent.detached", {"agent_id": agent_id, "reason": "deleted"}) in frames
+
+    async def test_a_room_joined_is_told_as_agent_rooms(self, harness: Harness) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            first_room = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+
+        second_room = await add_room(harness.session_factory, agent_id, name="new")
+        harness.protocol.connections.controllers.room_joined(agent_id, second_room)
+        (frame,) = await take(stream, 1)
+        await stream.aclose()
+
+        assert frame == (
+            "agent.rooms",
+            {"agent_id": agent_id, "rooms": sorted([first_room, second_room])},
+        )
+
+    async def test_a_session_command_reaches_the_stream_with_its_room(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+
+        command = room_control_frame(
+            agent_id=agent_id,
+            session_id=None,
+            room_id=room_id,
+            action="reset",
+            actor_id="@ada:test",
+            message_id="$reset",
+            thread_id=None,
+            surface="slack",
+            requester_name="Ada",
+            target_message_id=None,
+        )
+        assert harness.protocol.connections.relay_session_command(agent_id, command)
+        (frame,) = await take(stream, 1)
+        await stream.aclose()
+
+        assert frame == (
+            "agent.session_command",
+            {"agent_id": agent_id, "room_id": room_id, "command": command},
+        )
+
+    async def test_a_warm_reaches_the_stream_once_per_room(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            opened = await open_connection(client, controller)
+        stream = await open_stream(harness, controller, opened)
+        await take(stream, 2)
+
+        presence = harness.protocol.connections.controllers
+        assert presence.relay_warm(agent_id, room_id)
+        assert presence.relay_warm(agent_id, room_id)
+        (frame,) = await take(stream, 1)
+        assert not presence.relay_warm("not-bound", room_id)
+        await stream.aclose()
+
+        assert frame == ("agent.warm", {"agent_id": agent_id, "room_id": room_id})
+
+    async def test_the_nudges_are_merged_and_revocation_ends_the_stream(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            opened = await open_connection(client, controller)
+            stream = await open_stream(harness, controller, opened)
+            await take(stream, 1)
+            notifier = harness.management.service.notifier
+            notifier.operation_pending(
+                controller.controller_id,
+                operation_id="o1",
+                kind="provider.recheck",
+                agent_id=None,
+            )
+            pending = await take(stream, 1)
+            revoked = await client.delete(
+                f"/gateway/management/controllers/{controller.controller_id}",
+                cookies=cookies_for(owner),
+            )
+            assert revoked.status_code == 200, revoked.text
+            final = await take(stream, 1)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+
+        assert pending == [
+            (
+                "operation.pending",
+                {"operation_id": "o1", "kind": "provider.recheck", "agent_id": None},
+            )
+        ]
+        assert final == [("credential.revoked", {})]
+        assert notifier.subscriber_count(controller.controller_id) == 0
+
+
+class TestTheConnection:
+    async def test_reopening_takes_over_and_fences_the_old_connection(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            old = await open_connection(client, controller)
+            old_stream = await open_stream(harness, controller, old)
+            await take(old_stream, 1)
+            new = await open_connection(client, controller)
+            evicted = await take(old_stream, 1)
+            with pytest.raises(StopAsyncIteration):
+                await anext(old_stream)
+            stale = await beat(
+                harness,
+                controller,
+                connection_id=old["connection_id"],
+                generation=old["generation"],
+                cursors={},
+            )
+            wrong_generation = await beat(
+                harness,
+                controller,
+                connection_id=new["connection_id"],
+                generation=new["generation"] + 1,
+                cursors={},
+            )
+            unknown = await beat(
+                harness,
+                controller,
+                connection_id="nope",
+                generation=1,
+                cursors={},
+            )
+            no_stream = await beat(
+                harness,
+                controller,
+                connection_id=new["connection_id"],
+                generation=new["generation"],
+                cursors={},
+            )
+            old_events = await attach(
+                harness, controller, old["connection_id"], old["generation"]
+            )
+
+        assert new["generation"] != old["generation"]
+        assert evicted[0][0] == "evicted"
+        assert evicted[0][1]["code"] == "taken_over"
+        assert (stale.status_code, stale.json()["error"]["code"]) == (409, "taken_over")
+        assert (
+            wrong_generation.status_code,
+            wrong_generation.json()["error"]["code"],
+        ) == (
+            409,
+            "stale_generation",
+        )
+        assert (unknown.status_code, unknown.json()["error"]["code"]) == (
+            404,
+            "unknown_connection",
+        )
+        assert (no_stream.status_code, no_stream.json()["error"]["code"]) == (
+            409,
+            "no_stream",
+        )
+        assert (old_events.status_code, old_events.json()["error"]["code"]) == (
+            409,
+            "taken_over",
+        )
+
+    async def test_a_beat_keeps_its_agents_live_and_confirms_cursors(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        presence = harness.protocol.connections.controllers
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            room_id = await add_room(harness.session_factory, agent_id)
+            await _ask(harness, agent_id, room_id, "one")
+            # From before the event, so where the beat leaves the agent is
+            # told apart from where the stream attached it.
+            opened = await open_connection(client, controller, {agent_id: 0})
+            assert not presence.is_live(agent_id)
+            stream = await open_stream(harness, controller, opened)
+            await take(stream, 3)
+            beaten = await beat(
+                harness,
+                controller,
+                connection_id=opened["connection_id"],
+                generation=opened["generation"],
+                cursors={agent_id: 99, "not-mine": 3},
+            )
+            conn = presence.current_connection(controller.controller_id)
+        live = presence.is_live(agent_id)
+        await stream.aclose()
+
+        assert beaten.status_code == 200, beaten.text
+        assert beaten.json() == {"agents": [agent_id]}
+        assert live
+        # Confirmed where a reattached stream resumes: lowered to what this
+        # connection has sent the agent, and nothing for an agent that is not
+        # this controller's.
+        assert conn is not None
+        assert conn.resume_cursors == {agent_id: 1}
+        assert not presence.is_live(agent_id)
+
+    async def test_a_reattached_stream_resumes_from_the_confirmed_cursors(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            confirmed = await place_agent(client, controller, name="confirmed")
+            unconfirmed = await place_agent(client, controller, name="unconfirmed")
+            room_id = await add_room(harness.session_factory, confirmed, unconfirmed)
+            for body in ("one", "two", "three"):
+                await _ask(harness, confirmed, room_id, body)
+            await _ask(harness, unconfirmed, room_id, "x")
+            opened = await open_connection(client, controller, {confirmed: 0})
+            first = await open_stream(harness, controller, opened)
+            # state, two attaches, three events for `confirmed`
+            await take(first, 6)
+            beaten = await beat(
+                harness,
+                controller,
+                connection_id=opened["connection_id"],
+                generation=opened["generation"],
+                cursors={confirmed: 2},
+            )
+            assert beaten.status_code == 200, beaten.text
+            # The socket drops; events keep arriving; the same connection is
+            # streamed again.
+            await _ask(harness, unconfirmed, room_id, "y")
+            second = await open_stream(harness, controller, opened)
+            # The first stream may finish the pass it was on, then sees it
+            # was displaced and ends.
+            displaced = [parse_frame(raw) async for raw in first]
+            frames = await take(second, 5)
+        await second.aclose()
+
+        assert displaced[-1][0] == "evicted"
+        assert displaced[-1][1]["code"] == "taken_over"
+        attached = {
+            d["agent_id"]: d["from_seq"] for n, d in frames if n == "agent.attached"
+        }
+        # Where the beat confirmed it, not where the open asked.
+        assert attached[confirmed] == 2
+        # Where the first stream attached it, so nothing that arrived while
+        # the socket was down is skipped.
+        assert attached[unconfirmed] == 1
+        events = [(d["agent_id"], d["seq"]) for n, d in frames if n == "agent.event"]
+        assert sorted(events) == sorted([(confirmed, 3), (unconfirmed, 2)])
+
+    async def test_a_connected_agent_is_present_in_its_member_rooms_only(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        connections = harness.protocol.connections
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            here = await add_room(harness.session_factory, agent_id, name="here")
+            there = await add_room(harness.session_factory, agent_id, name="there")
+            outside = await add_room(harness.session_factory, name="outside")
+            opened = await open_connection(client, controller)
+            before_stream = rooms_occupied(agent_id, connections)
+            stream = await open_stream(harness, controller, opened)
+            await take(stream, 2)
+            connected = rooms_occupied(agent_id, connections)
+            present_outside = agents_present_in([agent_id], outside, connections)
+            promised = connections.can_spawn_for(agent_id, here)
+        await stream.aclose()
+
+        assert before_stream == set()
+        assert connected == {here, there}
+        assert present_outside == set()
+        assert promised is False
+        assert rooms_occupied(agent_id, connections) == set()
+
+    async def test_the_agent_detail_shows_one_session_while_connected(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            await add_room(harness.session_factory, agent_id, name="here")
+            await add_room(harness.session_factory, agent_id, name="there")
+            opened = await open_connection(client, controller)
+            stream = await open_stream(harness, controller, opened)
+            await take(stream, 2)
+
+            async def sessions() -> list[dict[str, object]]:
+                async with harness.session_factory() as session:
+                    agent = await AgentStore().get(session, agent_id)
+                    assert agent is not None
+                    rooms = await RoomStore().get_rooms_for_agent(
+                        session, agent_id, include_archived=True
+                    )
+                    detail = await assemble_agent_detail(
+                        session,
+                        agent=agent,
+                        visible_room_ids={room.id for room in rooms},
+                        agent_store=AgentStore(),
+                        room_store=RoomStore(),
+                        user_store=UserStore(),
+                        agent_session_store=AgentSessionStore(),
+                        room_role_store=RoomRoleStore(),
+                        connections=harness.protocol.connections,
+                    )
+                return [s.model_dump(exclude={"last_seen_at"}) for s in detail.sessions]
+
+            connected = await sessions()
+        await stream.aclose()
+        lapsed = await sessions()
+
+        assert connected == [
+            {
+                "room_id": None,
+                "room_name": None,
+                "lifecycle": "controller",
+                "state": "live",
+                "controller_id": controller.controller_id,
+            }
+        ]
+        assert lapsed == []
+
+    async def test_a_lapsed_beat_ends_the_stream_and_its_agents_are_not_live(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 0.05)
+        owner = await add_member(harness.session_factory, "ada")
+        presence = harness.protocol.connections.controllers
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+            opened = await open_connection(client, controller)
+            stream = await open_stream(harness, controller, opened)
+            await take(stream, 2)
+            assert presence.is_live(agent_id)
+            conn = presence._connections[controller.controller_id]
+            conn.last_beat = time.monotonic() - HEARTBEAT_TTL_SECONDS - 1
+            assert not presence.is_live(agent_id)
+            evicted = await take(stream, 1)
+            beaten = await beat(
+                harness,
+                controller,
+                connection_id=opened["connection_id"],
+                generation=opened["generation"],
+                cursors={},
+            )
+
+        assert evicted == [
+            (
+                "evicted",
+                {
+                    "code": "heartbeat_lapsed",
+                    "reason": "heartbeat lapsed; reopen the stream and resume "
+                    "from your cursor",
+                },
+            )
+        ]
+        assert (beaten.status_code, beaten.json()["error"]["code"]) == (
+            404,
+            "unknown_connection",
+        )
+
+    async def test_the_sweep_closes_a_lapsed_connection(self, harness: Harness) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        presence = harness.protocol.connections.controllers
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            opened = await open_connection(client, controller)
+        conn = presence._connections[controller.controller_id]
+        conn.last_beat = time.monotonic() - HEARTBEAT_TTL_SECONDS - 1
+
+        swept = presence.sweep()
+
+        assert [c.id for c in swept] == [opened["connection_id"]]
+        assert controller.controller_id not in presence._connections
+
+    async def test_another_controllers_stream_is_forbidden(
+        self, harness: Harness
+    ) -> None:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            mine = await enroll_console(harness, client, owner, "mine")
+            theirs = await enroll_console(harness, client, owner, "theirs")
+            response = await client.post(
+                f"/v1/controllers/{theirs.controller_id}/connection",
+                json={"cursors": {}},
+                headers=mine.headers,
+            )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+
+
+async def test_a_waiting_stream_wakes_promptly_for_an_event(harness: Harness) -> None:
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    pending = asyncio.ensure_future(anext(stream))
+    await asyncio.sleep(0.01)
+    await _ask(harness, agent_id, room_id, "now")
+    raw = await asyncio.wait_for(pending, timeout=2)
+    await stream.aclose()
+    assert raw["event"] == "agent.event"
+
+
+async def test_an_idle_pass_reads_its_agents_heads_together(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing new for any agent, the pass after each idle interval reads
+    the heads of all the controller's agents in one query, not each agent's
+    events in a session of its own."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 0.05)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        for n in range(5):
+            agent_id = await place_agent(client, controller, name=f"agent-{n}")
+            await add_room(harness.session_factory, agent_id, name=f"room-{n}")
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 6)
+    assert await anext(stream) is controller_routes.IDLE
+
+    buffer = harness.protocol.event_buffer
+    counting = CountingSessionFactory(buffer._session_factory)
+    monkeypatch.setattr(buffer, "_session_factory", counting)
+    assert await anext(stream) is controller_routes.IDLE
+    await stream.aclose()
+
+    # One read of the heads for the pass, and none when it waits.
+    assert counting.opened == 1
+
+
+async def test_a_delivery_reads_the_heads_once(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From the doorbell to waiting again, a delivery costs the read of the
+    heads and the agent's pass: the heads are not read again after
+    delivering, nor before waiting."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 60.0)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    await _ask(harness, agent_id, room_id, "@you")
+    buffer = harness.protocol.event_buffer
+    counting = CountingSessionFactory(buffer._session_factory)
+    monkeypatch.setattr(buffer, "_session_factory", counting)
+
+    [(name, _)] = await take(stream, 1)
+    waiting = asyncio.ensure_future(anext(stream))
+    await asyncio.sleep(0.2)
+    waiting.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await waiting
+    await stream.aclose()
+
+    assert name == "agent.event"
+    assert counting.opened == 2
+
+
+async def test_an_event_added_during_a_pass_is_sent_without_waiting(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An event added after the pass read the heads is past what the pass
+    reads, and its doorbell brings the next pass at once rather than after
+    the idle interval."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 60.0)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+
+    buffer = harness.protocol.event_buffer
+    read_from = buffer.read_from
+    added: list[asyncio.Task[int]] = []
+
+    async def read_while_another_arrives(*args: object, **kwargs: object) -> object:
+        if not added:
+            added.append(asyncio.create_task(_ask(harness, agent_id, room_id, "2nd")))
+            await added[0]
+        return await read_from(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(buffer, "read_from", read_while_another_arrives)
+    await _ask(harness, agent_id, room_id, "1st")
+    frames = await asyncio.wait_for(take(stream, 2), timeout=5)
+    await stream.aclose()
+
+    assert [data["event"]["payload"]["body"] for _, data in frames] == ["1st", "2nd"]
+
+
+async def test_a_backlog_past_one_batch_is_sent_without_waiting(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No doorbell rings for events already there, so a pass that stops at
+    the batch size reads again at once."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(controller_stream, "CATCH_UP_BATCH", 2)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    for n in range(5):
+        await _ask(harness, agent_id, room_id, f"#{n}")
+
+    frames = await asyncio.wait_for(take(stream, 5), timeout=5)
+    await stream.aclose()
+
+    assert [data["event"]["payload"]["body"] for _, data in frames] == [
+        f"#{n}" for n in range(5)
+    ]
+
+
+async def test_a_pass_that_cannot_get_a_connection_is_tried_again(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass that fails because the pool had no connection for it is tried
+    again, and its event is delivered, rather than the stream ending and the
+    controller's socket closing with every agent on it."""
+    monkeypatch.setattr(controller_stream, "PASS_RETRY_FIRST_SECONDS", 0.01)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+
+    buffer = harness.protocol.event_buffer
+    read_from = buffer.read_from
+    failed: list[bool] = []
+
+    async def no_connection_the_first_time(*args: object, **kwargs: object) -> object:
+        if not failed:
+            failed.append(True)
+            raise PoolTimeoutError("QueuePool limit reached, connection timed out")
+        return await read_from(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(buffer, "read_from", no_connection_the_first_time)
+    await _ask(harness, agent_id, room_id, "@you")
+    [(name, data)] = await take(stream, 1)
+    await stream.aclose()
+
+    assert failed == [True]
+    assert name == "agent.event"
+    assert data["event"]["payload"]["body"] == "@you"
+
+
+async def test_a_pass_that_fails_for_another_reason_ends_the_stream(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+
+    async def broken(*args: object, **kwargs: object) -> object:
+        raise ValueError("a bug, not the database")
+
+    monkeypatch.setattr(harness.protocol.event_buffer, "read_from", broken)
+    await _ask(harness, agent_id, room_id, "@you")
+    with pytest.raises(ValueError, match="a bug"):
+        await take(stream, 1)
+
+
+async def test_a_pass_still_failing_after_the_last_wait_ends_the_stream(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(controller_stream, "PASS_RETRY_FIRST_SECONDS", 0.01)
+    monkeypatch.setattr(controller_stream, "PASS_RETRY_GIVE_UP_SECONDS", 0.2)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+
+    async def never_a_connection(*args: object, **kwargs: object) -> object:
+        raise PoolTimeoutError("QueuePool limit reached, connection timed out")
+
+    monkeypatch.setattr(harness.protocol.event_buffer, "read_from", never_a_connection)
+    await _ask(harness, agent_id, room_id, "@you")
+    with pytest.raises(PoolTimeoutError):
+        await take(stream, 1, timeout=5)
+
+
+async def test_an_attach_that_fails_part_way_is_done_again_and_told_once(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing about an agent is kept until its attach is done, so one whose
+    attach fails is attached again from the start, and the controller hears
+    it attached once."""
+    monkeypatch.setattr(controller_stream, "PASS_RETRY_FIRST_SECONDS", 0.01)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+
+    buffer = harness.protocol.event_buffer
+    ensure_counting = buffer.ensure_counting
+    failed: list[bool] = []
+
+    async def no_connection_the_first_time(*args: object, **kwargs: object) -> object:
+        if not failed:
+            failed.append(True)
+            raise PoolTimeoutError("QueuePool limit reached, connection timed out")
+        return await ensure_counting(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(buffer, "ensure_counting", no_connection_the_first_time)
+    stream = await open_stream(harness, controller, opened)
+    opening = await take(stream, 2)
+    await _ask(harness, agent_id, room_id, "@you")
+    [(name, _)] = await take(stream, 1)
+    await stream.aclose()
+
+    assert failed == [True]
+    assert [frame_name for frame_name, _ in opening] == [
+        "connection_state",
+        "agent.attached",
+    ]
+    assert name == "agent.event"
+
+
+async def test_a_delivery_told_its_head_reads_only_the_agents_events(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While the notification listener listens, an event rings its agent's
+    doorbell with its number, and the pass it wakes takes the agent's head
+    from that rather than reading the heads: the delivery costs the agent's
+    pass alone."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 60.0)
+    buffer = harness.protocol.event_buffer
+    buffer.listening(True)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    # The stream's first pass reads every head; it then waits for a doorbell.
+    delivered = asyncio.ensure_future(take(stream, 1))
+    await asyncio.sleep(0.2)
+    await _ask(harness, agent_id, room_id, "@you")
+    counting = CountingSessionFactory(buffer._session_factory)
+    monkeypatch.setattr(buffer, "_session_factory", counting)
+
+    [(name, data)] = await delivered
+    await stream.aclose()
+
+    assert name == "agent.event"
+    assert data["event"]["payload"]["body"] == "@you"
+    assert counting.opened == 1
+
+
+async def test_an_event_never_told_is_found_after_the_idle_interval(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A notification can be lost without its connection dropping. The pass
+    after each idle interval reads the heads rather than taking the ones it
+    was told, so the event is sent then."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 0.05)
+    buffer = harness.protocol.event_buffer
+    buffer.listening(True)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    delivered = asyncio.ensure_future(take(stream, 1, timeout=5))
+    await asyncio.sleep(0.2)
+    # Stored the way `enqueue` stores it, without ringing anything.
+    row = await say(harness.session_factory, room_id, "@you", sender="@ada:test")
+    await buffer._store_own_event(
+        TENANT_ZERO_ID,
+        agent_id,
+        room_id,
+        _message(room_id, "@you", message_id=row.transport_event_id),
+        row.seq,
+        row.transport_event_id,
+    )
+
+    [(name, data)] = await delivered
+    await stream.aclose()
+
+    assert name == "agent.event"
+    assert data["event"]["payload"]["body"] == "@you"
+
+
+async def test_a_delivery_told_its_head_costs_three_statements(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tenant's binding, the agent's events with the rooms dropped after
+    its cursor, and the unread count with the baseline, window and user id it
+    is counted from: one statement each."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 60.0)
+    buffer = harness.protocol.event_buffer
+    buffer.listening(True)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        agent_id = await place_agent(client, controller, name="reviewer")
+        room_id = await add_room(harness.session_factory, agent_id)
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 2)
+    delivered = asyncio.ensure_future(take(stream, 1))
+    await asyncio.sleep(0.2)
+    await _ask(harness, agent_id, room_id, "@you")
+    # Counted as the query timing counts them, which sees the statements run
+    # on asyncpg directly (`db/raw.py`) as well as those run through SQLAlchemy.
+    instrument_queries(buffer._session_factory.kw["bind"])
+    registry = MetricsRegistry()
+    install(registry)
+    try:
+        [(name, data)] = await delivered
+    finally:
+        uninstall()
+    await stream.aclose()
+
+    assert name == "agent.event"
+    assert data["event"]["missed"] == {"count": 0, "reason": None}
+    timed = {
+        point.attributes["operation"]: point.count
+        for payload in registry.collect()
+        if payload.name == DB_QUERY_DURATION.name
+        for point in payload.histograms
+    }
+    # The unread count opens with `WITH`, which the timing labels `other`.
+    assert timed == {"tenant_bind": 1, "select": 1, "other": 1}
+
+
+async def test_a_wait_watches_one_bell_whatever_the_number_of_agents(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every attached agent's doorbell rings the stream's one bell, so a wait
+    is on three events (the bell, the connection's wake and the nudges'), not
+    one per agent and two more."""
+    monkeypatch.setattr(controller_routes, "IDLE_INTERVAL_SECONDS", 0.05)
+    owner = await add_member(harness.session_factory, "ada")
+    async with harness.client() as client:
+        controller = await enroll_console(harness, client, owner)
+        for n in range(5):
+            agent_id = await place_agent(client, controller, name=f"agent-{n}")
+            await add_room(harness.session_factory, agent_id, name=f"room-{n}")
+        opened = await open_connection(client, controller)
+    stream = await open_stream(harness, controller, opened)
+    await take(stream, 6)
+    assert await anext(stream) is controller_routes.IDLE
+    waited: list[object] = []
+    ensure_future = asyncio.ensure_future
+
+    def counting(awaitable: Any) -> Any:
+        waited.append(awaitable)
+        return ensure_future(awaitable)
+
+    monkeypatch.setattr(controller_stream.asyncio, "ensure_future", counting)
+    assert await anext(stream) is controller_routes.IDLE
+    await stream.aclose()
+
+    assert len(waited) == 3
+
+
+class TestToldHeads:
+    """What `EventBuffer.heads` takes from the doorbells instead of reading."""
+
+    @staticmethod
+    async def _agent(harness: Harness) -> str:
+        owner = await add_member(harness.session_factory, "ada")
+        async with harness.client() as client:
+            controller = await enroll_console(harness, client, owner)
+            agent_id = await place_agent(client, controller, name="reviewer")
+        harness.protocol.event_buffer.doorbell(agent_id)
+        return agent_id
+
+    @staticmethod
+    def _counting(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> Any:
+        buffer = harness.protocol.event_buffer
+        counting = CountingSessionFactory(buffer._session_factory)
+        monkeypatch.setattr(buffer, "_session_factory", counting)
+        return counting
+
+    async def test_a_head_told_while_listening_is_not_read(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        buffer.ring(agent_id, 41)
+        counting = self._counting(harness, monkeypatch)
+
+        assert await buffer.heads(TENANT_ZERO_ID, {agent_id}) == {agent_id: 41}
+        assert counting.opened == 0
+
+    async def test_a_lower_number_never_lowers_a_head(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two writers' notifications can arrive in either order."""
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        buffer.ring(agent_id, 41)
+        buffer.ring(agent_id, 40)
+
+        assert await buffer.heads(TENANT_ZERO_ID, {agent_id}) == {agent_id: 41}
+
+    async def test_no_head_is_kept_unless_the_listener_listens(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.ring(agent_id, 41)
+        counting = self._counting(harness, monkeypatch)
+
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+
+        assert counting.opened == 2
+
+    async def test_a_ring_without_a_number_forgets_the_head(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        buffer.ring(agent_id, 41)
+        buffer.ring(agent_id)
+        counting = self._counting(harness, monkeypatch)
+
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+
+        assert counting.opened == 1
+
+    async def test_a_reconnect_forgets_every_head_told(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Notifications sent while the listener was not listening are lost."""
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        buffer.ring(agent_id, 41)
+        buffer.listening(False)
+        buffer.listening(True)
+        counting = self._counting(harness, monkeypatch)
+
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+
+        assert counting.opened == 1
+
+    async def test_a_head_read_is_kept_and_not_read_again(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Any event numbered after the read rings with its number."""
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        counting = self._counting(harness, monkeypatch)
+
+        first = await buffer.heads(TENANT_ZERO_ID, {agent_id})
+        second = await buffer.heads(TENANT_ZERO_ID, {agent_id})
+
+        assert first == second
+        assert counting.opened == 1
+
+    async def test_a_head_read_across_a_reconnect_is_not_kept(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The read may have seen the agent's events before ones whose
+        notifications the reconnect lost."""
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        inner = buffer._session_factory
+
+        def reconnecting() -> Any:
+            buffer.listening(True)
+            return inner()
+
+        monkeypatch.setattr(buffer, "_session_factory", reconnecting)
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+        counting = CountingSessionFactory(inner)
+        monkeypatch.setattr(buffer, "_session_factory", counting)
+
+        await buffer.heads(TENANT_ZERO_ID, {agent_id})
+
+        assert counting.opened == 1
+
+    async def test_a_fresh_read_reads_the_heads_told(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent_id = await self._agent(harness)
+        buffer = harness.protocol.event_buffer
+        buffer.listening(True)
+        buffer.ring(agent_id, 41)
+        counting = self._counting(harness, monkeypatch)
+
+        await buffer.heads(TENANT_ZERO_ID, {agent_id}, fresh=True)
+
+        assert counting.opened == 1

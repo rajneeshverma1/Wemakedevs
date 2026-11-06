@@ -1,0 +1,352 @@
+"""Room-scoped resource reads/detaches must check room access (IDOR fix).
+
+The room-scoped document/reference/package endpoints authenticated the caller
+but never checked access to the room, so any authenticated user could read a
+private room's document content or detach (hard-delete) its resources by id.
+These tests pin the added `require_room_access` guard: a non-owner is refused
+(403) and the owner still gets through.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.db.models import Document, Room, User
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.document_store import DocumentStore
+from switch_core.db.stores.package_store import PackageStore
+from switch_core.db.stores.reference_store import ReferenceStore
+from switch_core.db.stores.reference_type_store import ReferenceTypeStore
+from switch_core.db.stores.room_link_store import RoomLinkStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.documents import (
+    detach_document_from_room,
+    get_room_document,
+    list_room_documents,
+    list_rooms_for_document,
+)
+from switch_core.gateway.packages import detach_package_from_room
+from switch_core.gateway.references import detach_reference_from_room
+from switch_core.gateway.room_links import (
+    get_room_link_graph,
+    list_inbound_linked_rooms,
+    list_linked_rooms,
+)
+
+_ROOM_STORE = RoomStore()
+_USER_STORE = UserStore()
+_AGENT_STORE = AgentStore()
+
+
+async def _is_admin(session: AsyncSession, user: User) -> bool:
+    """The bit `get_tenant_is_admin` hands the route, resolved the same way."""
+    return await _USER_STORE.administers(session, user)
+
+
+def _svc(session_factory: async_sessionmaker[AsyncSession]) -> ResourceService:
+    return ResourceService(
+        reference_store=ReferenceStore(),
+        reference_type_store=ReferenceTypeStore(),
+        document_store=DocumentStore(),
+        package_store=PackageStore(),
+        room_link_store=RoomLinkStore(),
+        session_factory=session_factory,
+    )
+
+
+async def _add_user(session: AsyncSession, *, name: str, role: str = "user") -> User:
+    user = User(name=name, email=f"{name}@example.com", role=role)
+    session.add(user)
+    await session.flush()
+    return user
+
+
+async def _add_private_room(session: AsyncSession, *, owner_id: str) -> Room:
+    room = Room(
+        transport_room_id="!r:test",
+        name="r",
+        description="d",
+        owner_id=owner_id,
+        read_visibility="private",
+        write_visibility="private",
+    )
+    session.add(room)
+    await session.flush()
+    return room
+
+
+class TestRoomResourceReadAuthz:
+    async def test_non_owner_cannot_read_room_document(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            with pytest.raises(HTTPException) as exc:
+                await get_room_document(
+                    room.id,
+                    "any-doc",
+                    session,
+                    svc,
+                    _USER_STORE,
+                    _AGENT_STORE,
+                    _ROOM_STORE,
+                    other,
+                    await _is_admin(session, other),
+                )
+            assert exc.value.status_code == 403
+
+    async def test_non_owner_cannot_list_room_documents(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            with pytest.raises(HTTPException) as exc:
+                await list_room_documents(
+                    room.id,
+                    session,
+                    svc,
+                    _USER_STORE,
+                    _AGENT_STORE,
+                    _ROOM_STORE,
+                    other,
+                    await _is_admin(session, other),
+                )
+            assert exc.value.status_code == 403
+
+    async def test_non_owner_cannot_detach_room_document(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            with pytest.raises(HTTPException) as exc:
+                await detach_document_from_room(
+                    room.id,
+                    "any-doc",
+                    session,
+                    svc,
+                    _ROOM_STORE,
+                    other,
+                    await _is_admin(session, other),
+                )
+            assert exc.value.status_code == 403
+
+    async def test_non_owner_cannot_detach_reference(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            with pytest.raises(HTTPException) as exc:
+                await detach_reference_from_room(
+                    room.id,
+                    "any-ref",
+                    session,
+                    svc,
+                    _ROOM_STORE,
+                    other,
+                    await _is_admin(session, other),
+                )
+            assert exc.value.status_code == 403
+
+    async def test_non_owner_cannot_detach_package(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            with pytest.raises(HTTPException) as exc:
+                await detach_package_from_room(
+                    room.id,
+                    "any-pkg",
+                    session,
+                    svc,
+                    _ROOM_STORE,
+                    other,
+                    await _is_admin(session, other),
+                )
+            assert exc.value.status_code == 403
+
+    async def test_owner_read_passes_authz(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        # Owner is past the authz gate: an empty room lists no documents, and a
+        # missing document is 404 (not 403), proving access was granted.
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            room = await _add_private_room(session, owner_id=owner.id)
+            svc = _svc(session_factory)
+
+            assert (
+                await list_room_documents(
+                    room.id,
+                    session,
+                    svc,
+                    _USER_STORE,
+                    _AGENT_STORE,
+                    _ROOM_STORE,
+                    owner,
+                    await _is_admin(session, owner),
+                )
+                == []
+            )
+            with pytest.raises(HTTPException) as exc:
+                await get_room_document(
+                    room.id,
+                    "missing",
+                    session,
+                    svc,
+                    _USER_STORE,
+                    _AGENT_STORE,
+                    _ROOM_STORE,
+                    owner,
+                    await _is_admin(session, owner),
+                )
+            assert exc.value.status_code == 404
+
+
+async def _add_room(
+    session: AsyncSession, *, name: str, owner_id: str, read_visibility: str
+) -> Room:
+    room = Room(
+        transport_room_id=f"!{name}:test",
+        name=name,
+        description=f"{name} desc",
+        owner_id=owner_id,
+        read_visibility=read_visibility,
+        write_visibility="private",
+    )
+    session.add(room)
+    await session.flush()
+    return room
+
+
+class TestRoomListingsHidePrivateRooms:
+    async def test_link_graph_leaves_out_unreadable_rooms_and_their_links(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            public = await _add_room(
+                session, name="pub", owner_id=owner.id, read_visibility="public"
+            )
+            private = await _add_room(
+                session, name="priv", owner_id=owner.id, read_visibility="private"
+            )
+            svc = _svc(session_factory)
+            await svc.attach_linked_room(
+                session, source_room_id=public.id, target_room_id=private.id, label="x"
+            )
+
+            async def graph_for(user: User) -> tuple[set[str], int]:
+                graph = await get_room_link_graph(
+                    session, svc, _ROOM_STORE, user, await _is_admin(session, user)
+                )
+                return {r.id for r in graph.rooms}, len(graph.links)
+
+            assert await graph_for(other) == ({public.id}, 0)
+            assert await graph_for(owner) == ({public.id, private.id}, 1)
+
+    async def test_a_rooms_links_leave_out_unreadable_rooms_on_either_end(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            public = await _add_room(
+                session, name="pub", owner_id=owner.id, read_visibility="public"
+            )
+            private = await _add_room(
+                session, name="priv", owner_id=owner.id, read_visibility="private"
+            )
+            svc = _svc(session_factory)
+            await svc.attach_linked_room(
+                session,
+                source_room_id=public.id,
+                target_room_id=private.id,
+                label="out",
+            )
+            await svc.attach_linked_room(
+                session, source_room_id=private.id, target_room_id=public.id, label="in"
+            )
+
+            async def links_for(user: User) -> tuple[set[str], set[str]]:
+                is_admin = await _is_admin(session, user)
+                outbound = await list_linked_rooms(
+                    public.id, session, svc, _ROOM_STORE, user, is_admin
+                )
+                inbound = await list_inbound_linked_rooms(
+                    public.id, session, svc, _ROOM_STORE, user, is_admin
+                )
+                return (
+                    {r.target_room_id for r in outbound},
+                    {r.source_room_id for r in inbound},
+                )
+
+            assert await links_for(other) == (set(), set())
+            assert await links_for(owner) == ({private.id}, {private.id})
+
+    async def test_rooms_for_document_leaves_out_unreadable_rooms(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            owner = await _add_user(session, name="owner")
+            other = await _add_user(session, name="other")
+            public = await _add_room(
+                session, name="pub", owner_id=owner.id, read_visibility="public"
+            )
+            private = await _add_room(
+                session, name="priv", owner_id=owner.id, read_visibility="private"
+            )
+            doc = Document(
+                owner_id=owner.id,
+                read_visibility="public",
+                write_visibility="private",
+                name="doc",
+                description="d",
+                instructions="",
+                content="c",
+            )
+            session.add(doc)
+            await session.flush()
+            svc = _svc(session_factory)
+            for room in (public, private):
+                await svc.attach_document_to_room(
+                    session, room.id, doc.id, user_id=owner.id
+                )
+
+            async def rooms_for(user: User) -> set[str]:
+                rows = await list_rooms_for_document(
+                    doc.id,
+                    session,
+                    svc,
+                    _ROOM_STORE,
+                    user,
+                    await _is_admin(session, user),
+                )
+                return {r.room_id for r in rows}
+
+            assert await rooms_for(other) == {public.id}
+            assert await rooms_for(owner) == {public.id, private.id}

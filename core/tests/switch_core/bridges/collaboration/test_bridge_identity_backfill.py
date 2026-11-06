@@ -1,0 +1,266 @@
+"""Agent identity provisioning must not hold up the bridge coming online.
+
+Provisioning is one platform call per agent, and a rate-limited platform turns
+that into minutes of mostly waiting. Awaiting it inside start() would delay the
+bridge, every other bridge queued behind it, and any request that restarts one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+
+from switch_core.bridges.collaboration.collaboration_core import CollaborationCore
+
+
+class _FakeAdapter:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def set_channel_migration_handler(self, handler: Any) -> None:
+        pass
+
+    def set_channel_type_handler(self, handler: Any) -> None:
+        pass
+
+    def set_channel_rename_handler(self, handler: Any) -> None:
+        pass
+
+    def set_agent_presentation_resolver(self, resolver: Any) -> None:
+        pass
+
+    def set_activity_resolver(self, resolver: Any) -> None:
+        pass
+
+    async def start(self, **kwargs: Any) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+def _core(provision: Any) -> tuple[CollaborationCore, _FakeAdapter]:
+    """A CollaborationCore with everything start() touches stubbed but the task logic."""
+    core = object.__new__(CollaborationCore)
+    adapter = _FakeAdapter()
+    core._bridge_type = "slack"  # type: ignore[attr-defined]
+    core._adapter = adapter  # type: ignore[attr-defined]
+    core._identity_task = None  # type: ignore[attr-defined]
+    core._identities_stale = True  # type: ignore[attr-defined]
+    core._identities_owed = set()  # type: ignore[attr-defined]
+    core._agent_view = None  # type: ignore[attr-defined]
+    core._channel_type_refresh_task = None  # type: ignore[attr-defined]
+
+    async def _noop() -> None:
+        return None
+
+    core._load_channel_map = _noop  # type: ignore[assignment]
+    core._load_existing_human_actors = _noop  # type: ignore[assignment]
+    core._ensure_channel_captures = _noop  # type: ignore[assignment]
+    core._refresh_channel_types = _noop  # type: ignore[assignment]
+    core._handle_channel_migrated = None  # type: ignore[attr-defined]
+    core._agent_presentation = None  # type: ignore[attr-defined]
+    core._handle_inbound_message = None  # type: ignore[attr-defined]
+    core._handle_inbound_command = None  # type: ignore[attr-defined]
+    core._handle_agent_joined_channel = None  # type: ignore[attr-defined]
+    core._handle_user_joined_channel = None  # type: ignore[attr-defined]
+    core._handle_app_joined_channel = None  # type: ignore[attr-defined]
+    core._create_agent_identities = provision  # type: ignore[assignment]
+    return core, adapter
+
+
+async def test_start_returns_without_waiting_for_provisioning() -> None:
+    finished = False
+
+    async def _slow_provision() -> None:
+        nonlocal finished
+        await asyncio.sleep(30)
+        finished = True
+
+    core, adapter = _core(_slow_provision)
+
+    await asyncio.wait_for(core.start(), timeout=1)
+
+    assert adapter.started
+    assert not finished
+    assert core._identity_task is not None
+    await core.stop()
+
+
+async def test_provisioning_still_runs_after_start_returns() -> None:
+    done = asyncio.Event()
+
+    async def _provision() -> None:
+        done.set()
+
+    core, _ = _core(_provision)
+
+    await core.start()
+    await asyncio.wait_for(done.wait(), timeout=1)
+
+    await core.stop()
+
+
+async def test_stop_cancels_provisioning_in_flight() -> None:
+    """A bridge being torn down must not leave work running against the
+    platform on its behalf."""
+    started = asyncio.Event()
+
+    async def _slow_provision() -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    core, _ = _core(_slow_provision)
+
+    await core.start()
+    task = core._identity_task
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await core.stop()
+
+    assert task is not None
+    await asyncio.sleep(0)
+    assert task.cancelled() or task.done()
+    assert core._identity_task is None
+
+
+async def test_a_failure_is_logged_rather_than_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """create_task discards whatever the coroutine raises, so anything escaping
+    the per-agent handling would otherwise vanish without trace."""
+
+    async def _explode() -> None:
+        raise RuntimeError("provisioning blew up")
+
+    core, _ = _core(_explode)
+
+    with caplog.at_level("ERROR"):
+        await core.start()
+        task = core._identity_task
+        assert task is not None
+        await task
+
+    assert any(
+        "identity provisioning stopped unexpectedly" in r.getMessage()
+        for r in caplog.records
+    )
+    await core.stop()
+
+
+async def test_stop_stops_the_activity_publisher() -> None:
+    events: list[str] = []
+
+    class Publisher:
+        def start(self) -> None:
+            events.append("started")
+
+        async def stop(self) -> None:
+            events.append("stopped")
+
+        async def activity_shown_at(self, channel_id: str, ref: str) -> None:
+            return None
+
+    async def provision():
+        pass
+
+    core, _ = _core(provision)
+    core._activity_publisher = Publisher()  # type: ignore[assignment]
+    await core.start()
+    await core.stop()
+    assert events == ["started", "stopped"]
+
+
+async def test_attach_reprovision_does_not_overwrite_a_running_task() -> None:
+    """A shared bridge re-provisions when its connection attaches, but must not
+    replace a start-time run still in flight: the run spends most of its life in
+    the agent read before the per-agent loop, so an attach then would otherwise
+    spawn a second provisioner (two concurrent create_agent_identity calls can
+    double a role) and orphan the handle stop() cancels."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_provision() -> None:
+        started.set()
+        await release.wait()
+
+    core, _ = _core(_slow_provision)
+    core._identity_task = asyncio.create_task(core._run_agent_identities())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    running = core._identity_task
+
+    core._provision_identities_on_attach()
+
+    assert core._identity_task is running  # not overwritten while live
+    release.set()
+    await core.stop()
+
+
+async def test_attach_reprovision_runs_when_no_task_is_live() -> None:
+    """The usual case: no run is going (a shared bridge skips the start-time
+    run while unattached), so attaching spawns a fresh provisioning run."""
+    runs = 0
+    done = asyncio.Event()
+
+    async def _provision() -> None:
+        nonlocal runs
+        runs += 1
+        done.set()
+
+    core, _ = _core(_provision)
+    core._identity_task = None
+
+    core._provision_identities_on_attach()
+    await asyncio.wait_for(done.wait(), timeout=1)
+
+    assert runs == 1
+    assert core._identity_task is not None
+    await core.stop()
+
+
+class _SharedAdapter(_FakeAdapter):
+    """A bridge on its platform's shared connection, attached after it starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.connection: object | None = None
+        self._on_attached: Any = None
+
+    def set_on_attached(self, callback: Any) -> None:
+        self._on_attached = callback
+
+    def attach_shared_connection(self, connection: object) -> None:
+        self.connection = connection
+        if self._on_attached is not None:
+            self._on_attached()
+
+    def awaiting_shared_connection(self) -> bool:
+        return self.connection is None
+
+
+async def test_a_shared_bridge_provisions_once_attached_rather_than_at_start() -> None:
+    """Started before the shared connection is up, every agent's call would
+    fail, each logged, and attaching provisions them all anyway."""
+    runs = 0
+    done = asyncio.Event()
+
+    async def _provision() -> None:
+        nonlocal runs
+        runs += 1
+        done.set()
+
+    core, _ = _core(_provision)
+    adapter = _SharedAdapter()
+    core._adapter = adapter  # type: ignore[assignment]
+
+    await core.start()
+    await asyncio.sleep(0)
+    assert core._identity_task is None
+    assert runs == 0
+
+    adapter.attach_shared_connection(object())
+    await asyncio.wait_for(done.wait(), timeout=1)
+    assert runs == 1
+    await core.stop()

@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from switch_core import room_service as room_service_module
+from switch_core.room_service import RECONCILE_BATCH_SIZE, RoomService
+
+
+class _FakeSessionCM:
+    async def __aenter__(self) -> _FakeSessionCM:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def commit(self) -> None:
+        return None
+
+
+class _FakeRoomStore:
+    def __init__(
+        self,
+        rooms: list[Any],
+        client_ids_by_room: dict[str, list[str]],
+        agent_clients_by_room: dict[str, dict[str, str]],
+    ) -> None:
+        self._rooms = rooms
+        self._client_ids_by_room = client_ids_by_room
+        self._agent_clients_by_room = agent_clients_by_room
+        self.added: list[tuple[str, str]] = []
+        self.batches: list[int] = []
+
+    async def get_all(
+        self, session: Any, *, include_archived: bool = False
+    ) -> list[Any]:
+        return list(self._rooms)
+
+    async def get_client_ids(self, session: Any, room_id: str) -> list[str]:
+        return list(self._client_ids_by_room.get(room_id, []))
+
+    async def get_member_agent_clients(
+        self, session: Any, room_id: str
+    ) -> dict[str, str]:
+        return dict(self._agent_clients_by_room.get(room_id, {}))
+
+    async def client_ids_by_room(
+        self, session: Any, room_ids: list[str]
+    ) -> dict[str, list[str]]:
+        self.batches.append(len(room_ids))
+        return {
+            room_id: list(self._client_ids_by_room[room_id])
+            for room_id in room_ids
+            if room_id in self._client_ids_by_room
+        }
+
+    async def member_agent_clients_by_room(
+        self, session: Any, room_ids: list[str]
+    ) -> dict[str, dict[str, str]]:
+        return {
+            room_id: dict(self._agent_clients_by_room[room_id])
+            for room_id in room_ids
+            if room_id in self._agent_clients_by_room
+        }
+
+    async def add_client(self, session: Any, client_id: str, room_id: str) -> None:
+        self.added.append((client_id, room_id))
+
+
+class _FakeClientLifecycle:
+    """Resolves system clients by type *and tenant*, mirroring the real lookup.
+
+    The tenant is not decoration. The real registry is process-wide and holds
+    one system client per tenant, so a lookup by type alone hands another
+    tenant's client to this room — which `client_rooms`' composite foreign key
+    rejects outright. `test_room_service_tenant_bindings.py` is where that is
+    proven against Postgres; here the signature is simply kept honest.
+    """
+
+    def __init__(self, by_type: dict[str, list[Any]]) -> None:
+        self._by_type = by_type
+
+    def get_by_type(self, client_type: str, tenant_id: str) -> list[Any]:
+        return [
+            client
+            for client in self._by_type.get(client_type, [])
+            if client.tenant_id == tenant_id
+        ]
+
+
+class _FakeProvisioning:
+    def __init__(self) -> None:
+        self.invited: list[tuple[str, str]] = []
+
+    async def record_join(
+        self, session: object, room_id: str, user_id: str
+    ) -> Callable[[], None]:
+        raise NotImplementedError
+
+    async def invite_to_room(
+        self, transport_room_id: str, transport_user_id: str
+    ) -> None:
+        self.invited.append((transport_room_id, transport_user_id))
+
+
+def _admin(tenant_id: str = "tenant-1") -> SimpleNamespace:
+    return SimpleNamespace(
+        client_id="admin-client",
+        transport_user_id="@switch-admin:switch.local",
+        tenant_id=tenant_id,
+    )
+
+
+def _build_service(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rooms: list[Any],
+    client_ids_by_room: dict[str, list[str]],
+    by_type: dict[str, list[Any]],
+    agent_clients_by_room: dict[str, dict[str, str]] | None = None,
+) -> tuple[RoomService, _FakeRoomStore, _FakeProvisioning]:
+    room_store = _FakeRoomStore(rooms, client_ids_by_room, agent_clients_by_room or {})
+    matrix = _FakeProvisioning()
+
+    # `reconcile_room_clients` now finds its tenants through `all_tenant_ids`,
+    # a real query against `tenants` (`db/tenant_lookup.py`) that the fake
+    # session below cannot answer — it is a stand-in for `RoomStore`, not for
+    # Postgres. Stubbing it to the tenants these fake rooms actually carry
+    # keeps the fan-out (one `get_all` per tenant, each room's own tenant
+    # bound around it) exercised without a real database.
+    tenant_ids = sorted({room.tenant_id for room in rooms})
+
+    async def _fake_all_tenant_ids(session_factory: Any) -> list[str]:
+        return tenant_ids
+
+    monkeypatch.setattr(room_service_module, "all_tenant_ids", _fake_all_tenant_ids)
+
+    svc = object.__new__(RoomService)
+    svc._session_factory = lambda: _FakeSessionCM()  # type: ignore[assignment]
+    svc._room_store = room_store  # type: ignore[assignment]
+    svc._client_lifecycle = _FakeClientLifecycle(by_type)  # type: ignore[assignment]
+    svc._provisioning = matrix  # type: ignore[assignment]
+    return svc, room_store, matrix
+
+
+class TestReconcileRoomClients:
+    async def test_backfills_missing_admin_into_existing_room(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A room created before the admin client existed: it has the other
+        # system clients but not the admin. Reconcile invites + records it.
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": ["resource-mgr", "observe"]},
+            by_type={"admin": [_admin()]},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == [("!mx:switch.local", "@switch-admin:switch.local")]
+        assert room_store.added == [("admin-client", "room-1")]
+
+    async def test_another_tenants_admin_client_is_not_offered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": []},
+            by_type={"admin": [_admin(tenant_id="tenant-2")]},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == []
+        assert room_store.added == []
+
+    async def test_skips_room_that_already_has_the_admin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": ["admin-client"]},
+            by_type={"admin": [_admin()]},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == []
+        assert room_store.added == []
+
+    async def test_covers_archived_rooms_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rooms = [
+            SimpleNamespace(
+                id="live", tenant_id="tenant-1", transport_room_id="!live:switch.local"
+            ),
+            SimpleNamespace(
+                id="archived",
+                tenant_id="tenant-1",
+                transport_room_id="!arch:switch.local",
+            ),
+        ]
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=rooms,
+            client_ids_by_room={"live": [], "archived": []},
+            by_type={"admin": [_admin()]},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert ("!live:switch.local", "@switch-admin:switch.local") in matrix.invited
+        assert ("!arch:switch.local", "@switch-admin:switch.local") in matrix.invited
+        assert ("admin-client", "live") in room_store.added
+        assert ("admin-client", "archived") in room_store.added
+
+    async def test_no_running_system_clients_is_a_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": []},
+            by_type={},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == []
+        assert room_store.added == []
+
+    async def test_reinvites_an_agent_whose_invite_never_landed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `add_agents_to_room` writes the membership row, invites, then records
+        # `room_clients`. A crash in that window leaves the member with no
+        # `room_clients` row, which is exactly what is repaired here.
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": []},
+            by_type={},
+            agent_clients_by_room={"room-1": {"agent-client": "@fixer:switch.local"}},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == [("!mx:switch.local", "@fixer:switch.local")]
+        assert room_store.added == [("agent-client", "room-1")]
+
+    async def test_an_agent_already_recorded_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        room = SimpleNamespace(
+            id="room-1", tenant_id="tenant-1", transport_room_id="!mx:switch.local"
+        )
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=[room],
+            client_ids_by_room={"room-1": ["agent-client"]},
+            by_type={},
+            agent_clients_by_room={"room-1": {"agent-client": "@fixer:switch.local"}},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert matrix.invited == []
+        assert room_store.added == []
+
+    async def test_reads_memberships_a_batch_of_rooms_at_a_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Startup waits on this under the boot lock, so its reads must not
+        # grow with one round trip per room.
+        count = RECONCILE_BATCH_SIZE * 2 + 1
+        rooms = [
+            SimpleNamespace(
+                id=f"room-{i}", tenant_id="tenant-1", transport_room_id=f"!{i}:s"
+            )
+            for i in range(count)
+        ]
+        svc, room_store, matrix = _build_service(
+            monkeypatch,
+            rooms=rooms,
+            client_ids_by_room={room.id: ["admin-client"] for room in rooms[1:]},
+            by_type={"admin": [_admin()]},
+        )
+
+        await svc.reconcile_room_clients()
+
+        assert room_store.batches == [RECONCILE_BATCH_SIZE, RECONCILE_BATCH_SIZE, 1]
+        assert matrix.invited == [("!0:s", "@switch-admin:switch.local")]
+        assert room_store.added == [("admin-client", "room-0")]

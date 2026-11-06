@@ -1,0 +1,813 @@
+"""Integration-test infrastructure: a real Postgres via testcontainers.
+
+Unlike the unit suite (which fakes the transport), these fixtures boot a real
+database and wire up the subset of `switch_core.main:run()` the feature under
+test needs, in-process. Messaging, membership and provisioning all run against
+that database, so a test drives the genuine path RoomService → provisioning →
+MessageRouter → EventBuffer (the agent_events tables).
+
+The container mirrors the `postgres` service in
+`deploy/local/docker-compose.yml` (see constants below — keep in sync). It gets
+an ephemeral host port, so the suite coexists with a running `just up` dev stack.
+
+Isolation model: the container, the Postgres database, its schema and the
+(stateless) stores are **session-scoped** (built once). Between tests the
+per-test `harness` fixture resets rows with TRUNCATE and rebuilds the in-memory
+services, so tests don't pay a per-test CREATE DATABASE.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
+from unittest.mock import MagicMock
+
+import asyncpg
+import pytest
+import pytest_asyncio
+from sqlalchemy import insert, text
+from sqlalchemy.ext.asyncio import AsyncEngine
+from testcontainers.postgres import PostgresContainer
+
+# Importing models registers every table on Base.metadata for create_all.
+import switch_core.db.models  # noqa: F401
+from switch_core.bridges.agent.api.handlers import (
+    _resolve_registration_user_id,
+    registration_path,
+)
+from switch_core.bridges.agent.api_key_cache import ApiKeyCache
+from switch_core.bridges.agent.protocol.agent_connections import AgentConnectionRegistry
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.bridges.agent.protocol.event_buffer import (
+    EventBuffer,
+    session_slots_for,
+)
+from switch_core.bridges.agent.protocol.types import (
+    IntegrationProfile,
+    RegistrationResult,
+)
+from switch_core.bridges.collaboration.lifecycle_service import (
+    CollaborationBridgeLifecycleService,
+)
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.actor import Actor, AgentActor, HumanActor
+from switch_core.clients.client_factory import ClientFactory
+from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+from switch_core.config import SwitchConfig
+from switch_core.db.base import Base
+from switch_core.db.engine import (
+    create_engine_from_config,
+    create_session_factory,
+    create_unpooled_engine,
+)
+from switch_core.db.models import TENANT_ZERO_ID, Tenant, User
+from switch_core.db.runtime_role import grant_runtime_role, verify_restricted_role
+from switch_core.db.stores.agent_session_store import AgentSessionStore
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.api_key_store import ApiKeyStore
+from switch_core.db.stores.bridge_message_map_store import BridgeMessageMapStore
+from switch_core.db.stores.budget_store import BudgetStore
+from switch_core.db.stores.client_store import ClientStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.delivery_cursor_store import DeliveryCursorStore
+from switch_core.db.stores.document_store import DocumentStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.media_store import MediaStore
+from switch_core.db.stores.message_store import MessageStore
+from switch_core.db.stores.ownership_lease_store import OwnershipLeaseStore
+from switch_core.db.stores.package_store import PackageStore
+from switch_core.db.stores.reference_store import ReferenceStore
+from switch_core.db.stores.reference_type_store import ReferenceTypeStore
+from switch_core.db.stores.room_link_store import RoomLinkStore
+from switch_core.db.stores.room_role_store import RoomRoleStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.switch_core_process_store import SwitchCoreProcessStore
+from switch_core.db.stores.tenant_store import TenantStore
+from switch_core.db.stores.usage_store import UsageStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.delivery.conversation import ConversationRules, ConversationSettings
+from switch_core.delivery.recipient import RecipientServices
+from switch_core.delivery.router import MessageRouter
+from switch_core.main import _seed_agent_registration_bootstrap_key
+from switch_core.messages.notify import MessageListener
+from switch_core.ownership import Ownership
+from switch_core.provisioning import Provisioning
+from switch_core.provisioning.postgres import PostgresProvisioning
+from switch_core.room_service import RoomService
+from switch_core.session_activity.listener import AgentSessionActivityListener
+from switch_core.session_activity.service import AgentSessionActivityService
+from switch_core.signals import SignalBus
+from switch_core.telemetry.messages import MessageTelemetry
+from switch_core.telemetry.service import TelemetryService
+from switch_core.telemetry.sink import NullSink
+from switch_core.tenant_context import tenant_scope
+from switch_core.transport.cursors import CursorWriter
+from switch_core.transport.ephemeral import EphemeralBus
+from switch_core.transport.invites import InviteBus
+from switch_core.transport.room_cache import RoomCacheLimits, RoomDeliveryCache
+from switch_core.trust.client import NullTrustClient
+from tests.ownership import process_lease_on
+
+# ── Mirrors deploy/local/docker-compose.yml — keep in sync ──────────────────────
+POSTGRES_IMAGE = "postgres:16-alpine"
+
+# Prefix for the role the application runs as here. `deploy/local/docker-compose.yml`
+# creates a fixed-name `switch_app`, and this suite's role is the same shape —
+# a plain restricted LOGIN role, granted the same way — but not the same name:
+# roles are cluster-wide, and a crashed session that never reached its own
+# teardown would otherwise leave `switch_app` behind for the next run's
+# `CREATE ROLE` to collide with. Each session gets its own `switch_app_<hex>`
+# instead, the same shape `rls_harness` (`core/tests/conftest.py`) already uses
+# for the same reason.
+RUNTIME_ROLE_PREFIX = "switch_app"
+
+# ── Throwaway test constants (not secrets — local ephemeral infra) ──────────────
+SERVER_NAME = "localhost"
+SECRET_KEYS = "test:dev-secret-key-for-integration-tests-0000"
+REGISTRATION_TOKEN = "dev-test-token"
+GATEWAY_ADMIN_EMAIL = "admin@switch.local"
+GATEWAY_ADMIN_PASSWORD = "admin"
+
+
+class _NoBridges:
+    """Stand-in for CollaborationBridgeLifecycleService when no bridge is configured.
+
+    Room creation only calls `.get(bridge_id)` when a bridge_id is set (ours is
+    None), and agent registration calls `.bridges_for_tenant()` for
+    bridge-identity creation. Both paths are exercised here as no-ops — the
+    feature under test involves no collaboration bridge.
+    """
+
+    def get(self, _bridge_id: str) -> None:
+        return None
+
+    def bridges_for_tenant(self, tenant_id: str) -> list:
+        return []
+
+
+@dataclass
+class StackInfo:
+    pg: PostgresContainer
+
+
+@dataclass
+class SessionEnv:
+    """Session-scoped pieces shared by every test: the engines/schema and the
+    (stateless) stores. The per-test `harness` fixture builds the in-memory
+    services on top of these.
+
+    Two engines, and which is which matters. `engine` is the restricted
+    runtime role every service here is wired to — the row-level-security
+    policies apply to it, so what this suite exercises is what a deployment
+    runs. `owner_engine` is the schema owner, used only for the two things
+    that need DDL and that the application never does: building the schema and
+    truncating it between tests.
+    """
+
+    config: SwitchConfig
+    engine: AsyncEngine
+    owner_engine: AsyncEngine
+    session_factory: object
+    agent_store: AgentStore
+    agent_session_store: AgentSessionStore
+    room_store: RoomStore
+    client_store: ClientStore
+    bridge_store: CollaborationBridgeStore
+    external_user_store: ExternalUserStore
+    api_key_store: ApiKeyStore
+    reference_store: ReferenceStore
+    reference_type_store: ReferenceTypeStore
+    document_store: DocumentStore
+    package_store: PackageStore
+    room_link_store: RoomLinkStore
+    room_role_store: RoomRoleStore
+    user_store: UserStore
+    message_store: MessageStore
+    media_store: MediaStore
+
+
+def _ensure_docker_host() -> None:
+    """Point docker-py at the active docker context when DOCKER_HOST is unset.
+
+    testcontainers' docker-py defaults to /var/run/docker.sock, which doesn't
+    exist under OrbStack/colima (and some Docker Desktop setups). Resolve the
+    daemon endpoint from `docker context inspect` so the suite runs regardless
+    of provider, without per-machine env setup.
+    """
+    if os.environ.get("DOCKER_HOST") or os.path.exists("/var/run/docker.sock"):
+        return
+    docker = shutil.which("docker")
+    if docker is None:
+        return
+    try:
+        out = subprocess.run(
+            [docker, "context", "inspect"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        host = json.loads(out.stdout)[0]["Endpoints"]["docker"]["Host"]
+    except (subprocess.SubprocessError, ValueError, KeyError, IndexError):
+        return
+    if host:
+        os.environ["DOCKER_HOST"] = host
+
+
+@pytest.fixture(scope="session")
+def switch_stack() -> Iterator[StackInfo]:
+    _ensure_docker_host()
+    with PostgresContainer(POSTGRES_IMAGE) as pg:
+        yield StackInfo(pg=pg)
+
+
+def _build_config(
+    stack: StackInfo,
+    db_name: str,
+    *,
+    user: str | None = None,
+    password: str | None = None,
+) -> SwitchConfig:
+    """Config for one of the two roles. Defaults to the container's own —
+    the schema owner — and is given the runtime role explicitly for the config
+    the application is actually wired with."""
+    pg = stack.pg
+    return SwitchConfig(
+        db_host=pg.get_container_host_ip(),
+        db_port=str(pg.get_exposed_port(5432)),
+        db_user=user or pg.username,
+        db_password=password or pg.password,
+        db_name=db_name,
+        id_server_name=SERVER_NAME,
+        agent_registration_token=REGISTRATION_TOKEN,
+        secret_keys=SECRET_KEYS,
+        gateway_admin_email=GATEWAY_ADMIN_EMAIL,
+        gateway_admin_password=GATEWAY_ADMIN_PASSWORD,
+        frontend_base_url=None,
+    )
+
+
+_PROFILE = IntegrationProfile(
+    connection_model="session_passive",
+    message_exchange=True,
+    pre_invocation_mediation=[],
+    post_invocation_mediation=[],
+    event_reporting=[],
+)
+
+
+class Harness:
+    """In-process switch-core wiring for integration tests.
+
+    Holds the real services and exposes the few operations a test needs:
+    register agents, start their clients, and reach the RoomService /
+    EventBuffer.
+    """
+
+    def __init__(
+        self,
+        *,
+        protocol: AgentCore,
+        room_service: RoomService,
+        client_lifecycle: ClientLifecycleService,
+        client_factory: ClientFactory,
+        room_store: RoomStore,
+        event_buffer: EventBuffer,
+        owner_id: str,
+        session_factory: object,
+        collab_lifecycle: object,
+        ownership: Ownership,
+    ) -> None:
+        self.protocol = protocol
+        # Which work this one process owns: all of it, as with one process
+        # in production, once `start_clients` has balanced.
+        self.ownership = ownership
+        # The real lifecycle under the `collaboration_bridges` marker, the
+        # no-bridges stand-in otherwise.
+        self.collab_lifecycle = collab_lifecycle
+        self.room_service = room_service
+        self.client_lifecycle = client_lifecycle
+        # Not registered by default — most tests never need a running admin
+        # client, and one running in every test room changes what every
+        # room_join-watching test sees (admin is itself a room member once its
+        # client runs). A test that needs the SystemActor (e.g. to read back an
+        # admin notice) registers it itself, through this, before start_clients().
+        self.client_factory = client_factory
+        self.room_store = room_store
+        self.event_buffer = event_buffer
+        self.owner_id = owner_id
+        self.session_factory = session_factory
+        self._registered: list[str] = []
+
+    async def register_agent(self, name: str) -> RegistrationResult:
+        result = await self.protocol.register_agent(
+            name=name,
+            description=f"integration test agent {name}",
+            connector_type="test",
+            integration_profile=_PROFILE,
+            owner_id=self.owner_id,
+            overwrite=True,
+            # Harness agents are open, so any test sender reaches them. Tests
+            # that exercise scoped addressing set a policy explicitly.
+            addressing_policy=None,
+        )
+        self._registered.append(result.agent_id)
+        return result
+
+    async def register_agent_via_registration_token(
+        self, name: str, token: str
+    ) -> RegistrationResult:
+        """Register the way a standalone agent does: with a bearer token
+        presented to `POST /agents`, its owner resolved by the endpoint's own
+        dependency rather than over real HTTP.
+
+        The tenant is the harness's, tenant zero, which is where the bootstrap
+        key lives; binding the token's own tenant is `BearerAuthMiddleware`'s
+        part, covered by `test_bearer_auth_tenant_binding.py`."""
+        async with self.session_factory() as session:  # type: ignore[operator]
+            owner_id = await _resolve_registration_user_id(
+                authorization=f"Bearer {token}",
+                session=session,
+                api_key_store=ApiKeyStore(),
+                protocol=self.protocol,
+            )
+        result = await self.protocol.register_agent(
+            name=name,
+            description=f"integration test agent {name}",
+            connector_type="test",
+            integration_profile=_PROFILE,
+            owner_id=owner_id,
+            overwrite=True,
+            registration_path=registration_path(),
+        )
+        self._registered.append(result.agent_id)
+        return result
+
+    async def start_clients(self, timeout: float = 20.0) -> None:
+        """Start every registered agent's client and await readiness.
+
+        `start_all` connects each client's actor as a background task; the actor
+        only loads its Agent (so `get_by_agent_id` resolves) once that task has
+        run. Poll until each is present and ready before returning.
+        """
+        await self.client_lifecycle.start_all()
+        await self.ownership.start()
+        for agent_id in self._registered:
+            client = await self._await_client(agent_id, timeout)
+            await client.wait_ready()
+
+    async def _await_client(self, agent_id: str, timeout: float) -> AgentActor:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            client = self.client_lifecycle.get_by_agent_id(agent_id)
+            if client is not None:
+                return client  # type: ignore[return-value]
+            await asyncio.sleep(0.1)
+        raise AssertionError(f"No running client for agent {agent_id} after {timeout}s")
+
+    def client_for(self, agent_id: str) -> AgentActor:
+        client = self.client_lifecycle.get_by_agent_id(agent_id)
+        if client is None:
+            raise AssertionError(f"No running client for agent {agent_id}")
+        return client  # type: ignore[return-value]
+
+    async def transport_room_id(self, room_id: str) -> str:
+        async with self.session_factory() as session:  # type: ignore[operator]
+            room = await self.room_store.get(session, room_id)
+        assert room is not None
+        return room.transport_room_id
+
+
+async def _admin_dsn(stack: StackInfo) -> str:
+    pg = stack.pg
+    return (
+        f"postgresql://{pg.username}:{pg.password}"
+        f"@{pg.get_container_host_ip()}:{pg.get_exposed_port(5432)}/{pg.dbname}"
+    )
+
+
+async def _seed_tenant_zero(engine: AsyncEngine) -> None:
+    """Insert the one tenant every scoped row's `tenant_id` default points at.
+
+    Needed right after schema creation, and again after every truncation:
+    `tenants` is in `Base.metadata.sorted_tables` like everything else, so
+    `_truncate_all` empties it along with the rest.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(Tenant.__table__).values(
+                id=TENANT_ZERO_ID, slug="default", name="Default"
+            )
+        )
+
+
+async def _truncate_all(engine: AsyncEngine) -> None:
+    """Reset row state between tests by truncating every mapped table at once.
+
+    `RESTART IDENTITY CASCADE` zeroes sequences and follows FK references, so a
+    single statement clears the whole graph regardless of table order.
+    """
+    tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
+    if not tables:
+        return
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
+    await _seed_tenant_zero(engine)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def session_env(switch_stack: StackInfo) -> AsyncIterator[SessionEnv]:
+    """The database, and the two roles that reach it.
+
+    **The application runs as a restricted role here, not as the owner**, and
+    that is the point of this fixture rather than an implementation detail of
+    it. Every row-level-security policy in this schema is inert against a
+    superuser or the tables' owner, so an integration suite connected as
+    either exercises the real code against a database with no isolation in it
+    — which is exactly how nineteen call sites came to depend on reads a
+    deployed system refuses, and why several of them were invisible until a
+    row existed. Wiring the app to a restricted role of its own makes this
+    suite the thing that catches the twentieth.
+
+    The owner connection stays, for the two jobs that genuinely need DDL and
+    that the application never does: building the schema, and truncating it
+    between tests.
+    """
+    # One database for the whole session; tests reset it with TRUNCATE rather than
+    # CREATE/DROP DATABASE. DROP at teardown uses FORCE to evict any still-open
+    # sync connections.
+    db_name = f"test_{uuid.uuid4().hex[:12]}"
+    admin_dsn = await _admin_dsn(switch_stack)
+    admin_conn = await asyncpg.connect(admin_dsn)
+    await admin_conn.execute(f'CREATE DATABASE "{db_name}"')
+    await admin_conn.close()
+
+    owner_engine = create_engine_from_config(_build_config(switch_stack, db_name))
+
+    # Schema is built directly from the SQLAlchemy models (not Alembic). This is
+    # fast and always matches the current models, but means the integration suite
+    # does NOT exercise the migration chain — model↔migration drift is caught
+    # separately by `just migrate`, not here.
+    async with owner_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await _seed_tenant_zero(owner_engine)
+
+    # Cluster-wide and unique per session, not the fixed name Compose creates
+    # (see `RUNTIME_ROLE_PREFIX` above): a session that crashes before its own
+    # teardown runs must not leave a role behind for the next run's `CREATE
+    # ROLE` to collide with.
+    runtime_role = f"{RUNTIME_ROLE_PREFIX}_{uuid.uuid4().hex[:12]}"
+    runtime_password = uuid.uuid4().hex
+    async with owner_engine.begin() as conn:
+        # CREATE ROLE takes no bind parameter for PASSWORD, so a fresh random
+        # throwaway is interpolated. Granted through `grant_runtime_role`, the
+        # same function a deployment runs at boot, so nothing here can pass on
+        # a privilege production has not got.
+        await conn.execute(
+            text(
+                f'CREATE ROLE "{runtime_role}" LOGIN '
+                f"PASSWORD '{runtime_password}' "
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS"
+            )
+        )
+        await grant_runtime_role(conn, runtime_role)
+
+    config = _build_config(
+        switch_stack, db_name, user=runtime_role, password=runtime_password
+    )
+    engine = create_engine_from_config(config)
+    session_factory = create_session_factory(engine)
+
+    # The same check `main.run()` makes before it serves a request: not a
+    # superuser, owns nothing policied, and cannot read a scoped table with no
+    # tenant bound. If this ever passed for the wrong reason, every isolation
+    # claim the suite below makes would be worth nothing.
+    await verify_restricted_role(engine)
+
+    env = SessionEnv(
+        config=config,
+        engine=engine,
+        owner_engine=owner_engine,
+        session_factory=session_factory,
+        agent_store=AgentStore(),
+        agent_session_store=AgentSessionStore(),
+        room_store=RoomStore(),
+        client_store=ClientStore(),
+        bridge_store=CollaborationBridgeStore(),
+        external_user_store=ExternalUserStore(),
+        api_key_store=ApiKeyStore(),
+        reference_store=ReferenceStore(),
+        reference_type_store=ReferenceTypeStore(),
+        document_store=DocumentStore(),
+        package_store=PackageStore(),
+        room_link_store=RoomLinkStore(),
+        room_role_store=RoomRoleStore(),
+        user_store=UserStore(),
+        message_store=MessageStore(),
+        media_store=MediaStore(),
+    )
+    try:
+        yield env
+    finally:
+        await engine.dispose()
+        # The role outlives the database it was granted in — roles are
+        # cluster-wide — so its privileges have to go before it can. `DROP
+        # OWNED BY` revokes what survives the database drop; it owns nothing,
+        # so there is nothing for it to drop.
+        async with owner_engine.begin() as conn:
+            await conn.execute(text(f'DROP OWNED BY "{runtime_role}"'))
+        await owner_engine.dispose()
+        admin_conn = await asyncpg.connect(admin_dsn)
+        try:
+            await admin_conn.execute(
+                f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'
+            )
+            await admin_conn.execute(f'DROP ROLE IF EXISTS "{runtime_role}"')
+        finally:
+            await admin_conn.close()
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def harness(
+    session_env: SessionEnv, request: pytest.FixtureRequest
+) -> AsyncIterator[Harness]:
+    # Truncation is DDL-adjacent and crosses every tenant, so it runs as
+    # the owner. Nothing the application does goes through this engine.
+    await _truncate_all(session_env.owner_engine)
+
+    config = session_env.config
+    session_factory = session_env.session_factory
+
+    # A real deployment always has a tenant bound by the time application code
+    # runs — an authenticated request or one of the background call sites
+    # `db/session_scope.py` covers. This harness stands in for both, so it binds
+    # tenant zero itself for the whole test (the same role `core/tests/conftest.py`'s
+    # `session_factory` fixture plays for the unit suite) rather than leaving every
+    # scoped write here and in the tests that use this fixture to hit
+    # `TenantNotBoundError`. Held open across the `yield`: the fixture and the
+    # test body run as one continuation, and the tests exercise ordinary
+    # request-shaped code that assumes a tenant is already bound, not the
+    # tenant-context machinery itself.
+    with tenant_scope(TENANT_ZERO_ID):
+        # Owner user for agent registration (api keys are owned by a user); recreated
+        # each test because the users table was just truncated.
+        owner = User(name="Admin", email=GATEWAY_ADMIN_EMAIL, role="admin")
+        async with session_factory() as session:  # type: ignore[operator]
+            await session_env.user_store.create(session, owner)
+            await session.commit()
+        owner_id = owner.id
+
+        # Seeds the same deployment-wide bootstrap key `main.py` would on a real
+        # boot, so a test can register through REGISTRATION_TOKEN exactly as a
+        # standalone agent does, without duplicating that seeding logic here.
+        await _seed_agent_registration_bootstrap_key(
+            session_factory,
+            session_env.user_store,
+            session_env.api_key_store,
+            session_env.agent_store,
+            config,
+        )
+
+        # Per-test wiring: a fresh EventBuffer / client registry so the readers'
+        # bookkeeping and client registrations never leak across tests. The
+        # queued events themselves are rows, cleared by the truncation above.
+        # No `AgentEventListener`: it wakes readers for rows another process
+        # wrote, and everything here runs in this one.
+        # The transport's wake-up path: rows are announced over LISTEN/NOTIFY, so
+        # nothing is delivered to a client until this connection is up.
+        message_listener = MessageListener(lambda: create_unpooled_engine(config))
+        await message_listener.start()
+        event_buffer = EventBuffer(
+            session_factory,  # type: ignore[arg-type]
+            sequence_base=0,
+            rooms=message_listener,
+            retention_seconds=config.agent_event_retention_seconds,
+            session_slots=session_slots_for(
+                config.db_pool_size, config.db_max_overflow
+            ),
+        )
+        connections = AgentConnectionRegistry()
+        collab_lifecycle: object = _NoBridges()
+        real_bridges = (
+            request.node.get_closest_marker("collaboration_bridges") is not None
+        )
+        session_activity_listener = AgentSessionActivityListener(
+            lambda: create_unpooled_engine(config)
+        )
+
+        invites = InviteBus()
+        ephemeral = EphemeralBus()
+
+        resource_service = ResourceService(
+            reference_store=session_env.reference_store,
+            reference_type_store=session_env.reference_type_store,
+            document_store=session_env.document_store,
+            package_store=session_env.package_store,
+            room_link_store=session_env.room_link_store,
+            session_factory=session_factory,
+        )
+
+        # Telemetry off: these flows are not about reporting, but the
+        # message hook must still be wired for the clients to build.
+        message_telemetry = MessageTelemetry(
+            telemetry=TelemetryService(
+                sink=NullSink(),
+                enabled=False,
+                client_id="",
+                version=None,
+                telemetry_environment="dev",
+                telemetry_internal=True,
+                deployment_kind="self_hosted",
+            ),
+            session_factory=session_factory,
+        )
+
+        router = MessageRouter(
+            services=RecipientServices(
+                session_factory=session_factory,  # type: ignore[arg-type]
+                event_buffer=event_buffer,
+                agent_store=session_env.agent_store,
+                room_store=session_env.room_store,
+                document_store=session_env.document_store,
+                reference_store=session_env.reference_store,
+                package_store=session_env.package_store,
+                agent_session_store=session_env.agent_session_store,
+                room_role_store=session_env.room_role_store,
+                external_user_store=session_env.external_user_store,
+                connections=connections,
+                frontend_base_url=config.dashboard_base_url,
+                message_telemetry=message_telemetry,
+            ),
+            message_store=session_env.message_store,
+            client_store=session_env.client_store,
+            budget_store=BudgetStore(),
+            conversation=ConversationRules(
+                settings=ConversationSettings.from_config(config),
+                message_store=session_env.message_store,
+                room_store=session_env.room_store,
+                agent_store=session_env.agent_store,
+                room_role_store=session_env.room_role_store,
+            ),
+        )
+
+        provisioning: Provisioning = PostgresProvisioning(
+            session_factory=session_factory,
+            room_store=session_env.room_store,
+            client_store=session_env.client_store,
+            router=router,
+            invites=invites,
+        )
+
+        room_cache = RoomDeliveryCache(
+            session_factory=session_factory,
+            message_store=session_env.message_store,
+            limits=RoomCacheLimits(
+                max_bytes=config.room_delivery_cache_max_bytes,
+                max_rooms=config.room_delivery_cache_max_rooms,
+                max_rows_per_room=config.room_delivery_cache_max_rows_per_room,
+                max_age_seconds=config.room_delivery_cache_max_age_seconds,
+            ),
+        )
+
+        client_factory = ClientFactory(
+            client_store=session_env.client_store,
+            session_factory=session_factory,
+            config=config,
+            room_store=session_env.room_store,
+            message_store=session_env.message_store,
+            usage_store=UsageStore(),
+            media_store=session_env.media_store,
+            listener=message_listener,
+            invites=invites,
+            ephemeral=ephemeral,
+            room_cache=room_cache,
+            message_observer=message_telemetry,
+            router=router,
+        )
+        client_factory.register("agent", AgentActor)
+        client_factory.register("user", HumanActor)
+        client_factory.register("bridge", Actor)
+
+        # This process's lease and what it owns, as `main` wires them. The
+        # signal bus is never started: there is no other process to tell.
+        lease = process_lease_on(session_factory)  # type: ignore[arg-type]
+        ownership = Ownership(
+            lease=lease,
+            session_factory=session_factory,  # type: ignore[arg-type]
+            bus=SignalBus(
+                session_factory,  # type: ignore[arg-type]
+                lambda: create_unpooled_engine(config),
+                process_id=lease.process_id,
+            ),
+            store=OwnershipLeaseStore(),
+            processes=SwitchCoreProcessStore(),
+        )
+        cursor_writer = CursorWriter(
+            session_factory=session_factory,  # type: ignore[arg-type]
+            cursors=DeliveryCursorStore(),
+            leases=OwnershipLeaseStore(),
+            process_id=lease.process_id,
+        )
+        cursor_writer_task = asyncio.create_task(cursor_writer.run())
+
+        client_lifecycle = ClientLifecycleService(
+            provisioning=provisioning,
+            client_store=session_env.client_store,
+            tenant_store=TenantStore(),
+            client_factory=client_factory,
+            session_factory=session_factory,
+            config=config,
+            tenants_isolated=True,
+            ownership=ownership,
+            cursor_writer=cursor_writer,
+        )
+
+        if real_bridges:
+            collab_lifecycle = CollaborationBridgeLifecycleService(
+                bridge_store=session_env.bridge_store,
+                external_user_store=session_env.external_user_store,
+                bridge_message_map_store=BridgeMessageMapStore(),
+                room_store=session_env.room_store,
+                agent_store=session_env.agent_store,
+                client_store=session_env.client_store,
+                client_lifecycle=client_lifecycle,
+                room_service=None,  # type: ignore[arg-type]  # set below
+                provisioning=provisioning,
+                session_factory=session_factory,
+                config=config,
+                client_factory=client_factory,
+                session_activity_listener=session_activity_listener,
+                session_activity_service=AgentSessionActivityService(session_factory),
+                connections=connections,
+                ownership=ownership,
+                cursor_writer=cursor_writer,
+            )
+
+        room_service = RoomService(
+            provisioning=provisioning,
+            room_store=session_env.room_store,
+            agent_store=session_env.agent_store,
+            client_lifecycle=client_lifecycle,
+            collab_lifecycle=collab_lifecycle,  # type: ignore[arg-type]
+            collab_bridge_store=session_env.bridge_store,
+            resource_service=resource_service,
+            session_factory=session_factory,
+            room_cache=room_cache,
+        )
+        if isinstance(collab_lifecycle, CollaborationBridgeLifecycleService):
+            collab_lifecycle._room_service = room_service
+
+        protocol = AgentCore(
+            agent_store=session_env.agent_store,
+            agent_session_store=session_env.agent_session_store,
+            room_store=session_env.room_store,
+            room_service=room_service,
+            client_lifecycle=client_lifecycle,
+            collab_lifecycle=collab_lifecycle,  # type: ignore[arg-type]
+            event_buffer=event_buffer,
+            resource_service=resource_service,
+            api_key_store=session_env.api_key_store,
+            api_key_cache=ApiKeyCache(
+                ttl_seconds=config.agent_auth_cache_ttl_seconds,
+                max_entries=config.agent_auth_cache_max_entries,
+            ),
+            external_user_store=session_env.external_user_store,
+            bridge_store=session_env.bridge_store,
+            session_factory=session_factory,
+            config=config,
+            # Required since #543; no integration test answers an approval.
+            approval_outcomes=MagicMock(),
+            trust_client=NullTrustClient(),
+            connections=connections,
+        )
+
+        h = Harness(
+            protocol=protocol,
+            room_service=room_service,
+            client_lifecycle=client_lifecycle,
+            client_factory=client_factory,
+            room_store=session_env.room_store,
+            event_buffer=event_buffer,
+            owner_id=owner_id,
+            session_factory=session_factory,
+            collab_lifecycle=collab_lifecycle,
+            ownership=ownership,
+        )
+        try:
+            yield h
+        finally:
+            await ownership.stop()
+            cursor_writer_task.cancel()
+            if isinstance(collab_lifecycle, CollaborationBridgeLifecycleService):
+                await collab_lifecycle.stop_all()
+            # Stop the agents' receive loops before the next test truncates, so none
+            # is mid-query against a table being cleared.
+            await client_lifecycle.stop_all()
+            await message_listener.stop()
+            await provisioning.close()

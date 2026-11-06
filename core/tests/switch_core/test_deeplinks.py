@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import re
+import time
+from pathlib import Path
+
+import pytest
+
+from switch_core.deeplinks import (
+    CONSOLE_PAGES,
+    DEEPLINK_REDIRECT_PATH,
+    deeplink_for_platform,
+    gateway_query_to_switchdash,
+    gateway_url_is_loopback,
+    gateway_url_warning,
+    parse_console_link,
+    rewrite_console_links,
+    switchdash_to_gateway,
+)
+
+_DEEPLINK = "switchdash://session?server=https%3A%2F%2Fs&agent=a&room=r&session=x"
+
+
+class TestDeeplinkForPlatform:
+    """Which form of the link a platform is given (CHOO-2173).
+
+    The gateway redirect exists for platforms that will not linkify a custom
+    scheme — Discord, Telegram. It was being handed to every platform on any
+    deployment that configured a gateway URL, which every managed stack does,
+    so Mattermost was sending readers through the browser to reach a link its
+    own client would have opened.
+    """
+
+    def test_a_platform_that_renders_the_scheme_gets_the_real_link(self) -> None:
+        assert deeplink_for_platform(_DEEPLINK, "https://gw.example", True) == _DEEPLINK
+
+    def test_a_platform_that_does_not_gets_the_redirect(self) -> None:
+        assert deeplink_for_platform(_DEEPLINK, "https://gw.example", False) == (
+            "https://gw.example/deeplink/session"
+            "?server=https%3A%2F%2Fs&agent=a&room=r&session=x"
+        )
+
+    def test_without_a_gateway_url_there_is_nothing_to_rewrite_to(self) -> None:
+        assert deeplink_for_platform(_DEEPLINK, None, False) == _DEEPLINK
+
+    def test_no_deeplink_stays_no_deeplink(self) -> None:
+        assert deeplink_for_platform(None, "https://gw.example", False) is None
+
+    def test_a_link_that_is_not_a_session_deeplink_is_left_alone(self) -> None:
+        assert (
+            deeplink_for_platform("https://elsewhere/x", "https://gw.example", False)
+            == "https://elsewhere/x"
+        )
+
+
+class TestSwitchdashToGateway:
+    def test_rewrites_session_deeplink_to_gateway_redirect(self) -> None:
+        result = switchdash_to_gateway(_DEEPLINK, "https://gw.example")
+        assert result == (
+            "https://gw.example/deeplink/session"
+            "?server=https%3A%2F%2Fs&agent=a&room=r&session=x"
+        )
+
+    def test_strips_trailing_slash_on_base(self) -> None:
+        result = switchdash_to_gateway(_DEEPLINK, "https://gw.example/")
+        assert result is not None
+        assert result.startswith("https://gw.example/deeplink/session?")
+
+    def test_deeplink_without_query_has_no_question_mark(self) -> None:
+        result = switchdash_to_gateway("switchdash://session", "https://gw.example")
+        assert result == "https://gw.example/deeplink/session"
+
+    def test_non_switchdash_scheme_returns_none(self) -> None:
+        assert (
+            switchdash_to_gateway("https://elsewhere/x", "https://gw.example") is None
+        )
+
+    def test_wrong_host_returns_none(self) -> None:
+        assert (
+            switchdash_to_gateway("switchdash://other?a=b", "https://gw.example")
+            is None
+        )
+
+
+class TestGatewayUrlIsLoopback:
+    """A configured origin that only the Switch host can reach.
+
+    A locally managed server hands Switch Console's own `http://localhost:<port>`
+    to GATEWAY_PUBLIC_URL, which makes every posted link clickable and useless to
+    anyone reading from a phone.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:8000",
+            "http://LOCALHOST",
+            "http://localhost.:8000",
+            "http://switch.localhost",
+            "http://127.0.0.1:54212",
+            "http://127.1.2.3",
+            "http://[::1]:8000",
+        ],
+    )
+    def test_an_origin_only_this_machine_can_reach_is_loopback(self, url: str) -> None:
+        assert gateway_url_is_loopback(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gw.example",
+            "https://localhost.example",
+            "http://10.0.0.1:8000",
+            "http://0.0.0.0:8000",
+            "https://[2001:db8::1]",
+        ],
+    )
+    def test_an_origin_someone_else_could_reach_is_not(self, url: str) -> None:
+        assert gateway_url_is_loopback(url) is False
+
+
+class TestGatewayUrlWarning:
+    def test_a_loopback_origin_is_announced_rather_than_left_silent(self) -> None:
+        warning = gateway_url_warning("http://localhost:54212", False)
+        assert warning is not None
+        assert "http://localhost:54212" in warning
+        assert "loopback" in warning
+
+    def test_a_loopback_origin_is_announced_even_where_no_rewrite_happens(
+        self,
+    ) -> None:
+        # The deeplink is posted raw here, but it still carries the origin as
+        # the server Switch Console is told to reach.
+        assert gateway_url_warning("http://127.0.0.1:54212", True) is not None
+
+    def test_an_unset_origin_costs_a_clickable_link_on_an_http_only_platform(
+        self,
+    ) -> None:
+        warning = gateway_url_warning(None, False)
+        assert warning is not None
+        assert "not set" in warning
+
+    def test_an_unset_origin_costs_nothing_where_the_scheme_renders(self) -> None:
+        assert gateway_url_warning(None, True) is None
+
+    @pytest.mark.parametrize("renders", [True, False])
+    def test_a_reachable_origin_warns_about_nothing(self, renders: bool) -> None:
+        assert gateway_url_warning("https://gw.example", renders) is None
+
+
+class TestGatewayQueryToSwitchdash:
+    def test_reconstructs_deeplink_from_query(self) -> None:
+        query = "server=https%3A%2F%2Fs&agent=a&room=r&session=x"
+        assert gateway_query_to_switchdash(query) == f"switchdash://session?{query}"
+
+    def test_empty_query_has_no_question_mark(self) -> None:
+        assert gateway_query_to_switchdash("") == "switchdash://session"
+
+    def test_round_trip(self) -> None:
+        gateway = switchdash_to_gateway(_DEEPLINK, "https://gw.example")
+        assert gateway is not None
+        query = gateway.split(DEEPLINK_REDIRECT_PATH + "?", 1)[1]
+        assert gateway_query_to_switchdash(query) == _DEEPLINK
+
+
+_CONSOLE_LINKS_TS = (
+    Path(__file__).resolve().parents[3]
+    / "console/apps/switch-console-desktop/src/shared/core/deeplinks/console-links.ts"
+)
+
+
+def _console_catalogue() -> dict[str, tuple[bool, list[str]]]:
+    """Switch Console's `CONSOLE_PAGES`: each page, whether it names an id,
+    and its tabs, read from the source the app is built from."""
+    source = _CONSOLE_LINKS_TS.read_text()
+    block = source.split("export const CONSOLE_PAGES = {", 1)[1].split("} as const", 1)[
+        0
+    ]
+    entries = re.split(r"^  '?([a-z/-]+)'?: \{", block, flags=re.MULTILINE)[1:]
+    catalogue: dict[str, tuple[bool, list[str]]] = {}
+    for name, body in zip(entries[::2], entries[1::2], strict=True):
+        tabs = re.search(r"tabs: \[([^\]]*)\]", body)
+        catalogue[name] = (
+            "id: '" in body,
+            re.findall(r"'([^']+)'", tabs.group(1)) if tabs else [],
+        )
+    return catalogue
+
+
+class TestConsoleCatalogue:
+    """The pages the server hands off to are the pages Switch Console opens."""
+
+    def test_the_server_knows_every_page_console_opens_and_no_other(self) -> None:
+        catalogue = _console_catalogue()
+        assert len(catalogue) > 10
+        assert {
+            page: (spec.has_id, sorted(spec.tabs))
+            for page, spec in CONSOLE_PAGES.items()
+        } == {
+            page: (has_id, sorted(tabs)) for page, (has_id, tabs) in catalogue.items()
+        }
+
+
+class TestParseConsoleLink:
+    """The same rules Switch Console reads a link by (`parseConsoleLink`)."""
+
+    def test_reads_a_tab_the_page_had_before_as_the_one_it_became(self) -> None:
+        link = parse_console_link("switchdash://open/settings?tab=general")
+        assert link is not None
+        assert link.tab == "general"
+        assert link.page_name == "Switch Console's preferences"
+        assert parse_console_link("switchdash://open/settings?tab=browser") is None
+
+    def test_reads_a_page_its_id_and_its_tab(self) -> None:
+        link = parse_console_link("switchdash://open/agent/a-1?tab=settings&server=x")
+        assert link is not None
+        assert (link.page, link.id, link.tab) == ("agent", "a-1", "settings")
+        assert link.page_name == "your agent's settings"
+        assert link.switchdash_url == (
+            "switchdash://open/agent/a-1?tab=settings&server=x"
+        )
+
+    def test_reads_a_page_whose_name_has_a_slash(self) -> None:
+        link = parse_console_link("switchdash://open/messaging-apps/connect")
+        assert link is not None
+        assert (link.page, link.id) == ("messaging-apps/connect", None)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "switchdash://session?room=r",
+            "switchdash://open/nowhere",
+            "switchdash://open/agent",
+            "switchdash://open/agents/x",
+            "switchdash://open/room/<room-id>",
+            "switchdash://open/agent/a-1?tab=logs",
+            "switchdash://open/home?tab=general",
+            "https://open/home",
+        ],
+    )
+    def test_refuses_what_console_would_refuse(self, url: str) -> None:
+        assert parse_console_link(url) is None
+
+
+class TestRewriteConsoleLinks:
+    def test_a_link_becomes_the_https_route_keeping_its_label(self) -> None:
+        assert (
+            rewrite_console_links(
+                "See [Rooms](switchdash://open/rooms).", "https://gw.example/"
+            )
+            == "See [Rooms](https://gw.example/deeplink/open/rooms)."
+        )
+
+    def test_without_a_public_address_the_page_is_named(self) -> None:
+        assert (
+            rewrite_console_links(
+                "[Connect Slack](switchdash://open/messaging-apps/connect)", None
+            )
+            == "Connect Slack (in Switch Console: the page to connect a messaging app)"
+        )
+
+    def test_every_link_in_a_body_is_rewritten(self) -> None:
+        body = "[A](switchdash://open/home) and [B](switchdash://open/invite)"
+        assert rewrite_console_links(body, "https://gw") == (
+            "[A](https://gw/deeplink/open/home) and [B](https://gw/deeplink/open/invite)"
+        )
+
+    def test_a_fenced_block_is_left_as_written(self) -> None:
+        body = "```\n[A](switchdash://open/home)\n```"
+        assert rewrite_console_links(body, "https://gw") == body
+
+    def test_unmatched_brackets_do_not_stall_the_bridge(self) -> None:
+        body = "switchdash://open/home " + "[unclosed " * 20_000
+
+        started = time.monotonic()
+        assert rewrite_console_links(body, "https://gw") == body
+        assert time.monotonic() - started < 1.0

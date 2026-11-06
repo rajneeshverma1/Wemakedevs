@@ -1,0 +1,147 @@
+import json
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from switch_core.db.models import User
+from switch_core.db.stores.service_connection_store import ServiceConnectionStore
+from switch_core.gateway.auth import get_current_user
+from switch_core.gateway.connection_catalog import router
+from switch_core.gateway.dependencies import get_config, get_session
+from switch_core.keys import Keyring
+
+TEST_KEYRING = Keyring.parse("test:" + "x" * 40, legacy_secret=None)
+
+
+class _Config:
+    def __init__(self, service_connections_enabled: bool) -> None:
+        self.service_connections_enabled = service_connections_enabled
+
+
+@pytest.fixture
+def services_on() -> bool:
+    return True
+
+
+@pytest.fixture
+async def catalog_app(session_factory, services_on):
+    async with session_factory() as session:
+        for user_id in ("catalog-user", "other-user"):
+            session.add(
+                User(
+                    id=user_id,
+                    name=user_id,
+                    email=f"{user_id}@example.com",
+                    role="user",
+                    password_hash="unused",
+                )
+            )
+        await session.commit()
+        user = await session.get(User, "catalog-user")
+
+    async def sessions():
+        async with session_factory() as session:
+            yield session
+
+    app = FastAPI()
+    app.include_router(router, prefix="/gateway")
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_session] = sessions
+    app.dependency_overrides[get_config] = lambda: _Config(services_on)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://switch.example.com"
+    ) as client:
+        yield client, session_factory
+
+
+async def link_github(session_factory, user_id):
+    async with session_factory() as session:
+        await ServiceConnectionStore().save_connection(
+            session,
+            user_id=user_id,
+            service="github",
+            consent="write",
+            granted_scopes=[],
+            account_id=f"account-{user_id}",
+            external_identity=user_id,
+            encrypted_secret=TEST_KEYRING.encrypt(
+                json.dumps({"access_token": "SYNTHETIC"})
+            ),
+            oauth_client_id=None,
+        )
+        await session.commit()
+
+
+def statuses(response):
+    assert response.status_code == 200, response.text
+    return {entry["slug"]: entry["status"] for entry in response.json()["connections"]}
+
+
+async def test_catalog_lists_the_enabled_services_and_placeholders(catalog_app):
+    client, _ = catalog_app
+    response = await client.get("/gateway/provider-connections/catalog")
+    result = statuses(response)
+    assert result.pop("github") == "not_connected"
+    # A Console this older route serves connects GitHub alone, whatever else
+    # is enabled.
+    assert result.pop("airtable") == "not_connected"
+    assert result.pop("atlassian") == "not_connected"
+    assert result.pop("google-workspace") == "not_connected"
+    assert result.pop("datadog") == "not_connected"
+    assert len(result) == 11
+    assert set(result.values()) == {"coming_soon"}
+    github = next(
+        entry for entry in response.json()["connections"] if entry["slug"] == "github"
+    )
+    assert github == {
+        "slug": "github",
+        "name": "GitHub",
+        "category": "Source control",
+        "description": github["description"],
+        "enabled": True,
+        "auth_type": "oauth",
+        "status": "not_connected",
+        "can_revoke": False,
+    }
+
+
+@pytest.mark.parametrize("services_on", [False])
+async def test_with_service_connections_off_github_alone_is_offered(catalog_app):
+    client, _ = catalog_app
+    result = statuses(await client.get("/gateway/provider-connections/catalog"))
+    assert result.pop("github") == "not_connected"
+    assert set(result.values()) == {"coming_soon"}
+
+
+async def test_catalog_reports_only_the_callers_connection(catalog_app):
+    client, factory = catalog_app
+    await link_github(factory, "other-user")
+    assert (
+        statuses(await client.get("/gateway/provider-connections/catalog"))["github"]
+        == "not_connected"
+    )
+    await link_github(factory, "catalog-user")
+    assert (
+        statuses(await client.get("/gateway/provider-connections/catalog"))["github"]
+        == "connected"
+    )
+
+
+async def test_only_the_callers_own_connection_may_be_revoked(catalog_app):
+    client, factory = catalog_app
+
+    def revocable(response):
+        assert response.status_code == 200, response.text
+        return {e["slug"]: e["can_revoke"] for e in response.json()["connections"]}
+
+    await link_github(factory, "other-user")
+    assert (
+        revocable(await client.get("/gateway/provider-connections/catalog"))["github"]
+        is False
+    )
+    await link_github(factory, "catalog-user")
+    assert (
+        revocable(await client.get("/gateway/provider-connections/catalog"))["github"]
+        is True
+    )
